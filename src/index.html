@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎙️ Voice Chat — Hermes</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: #e0e0e0;
+            overflow: hidden;
+        }
+        .container {
+            text-align: center;
+            padding: 2rem;
+            max-width: 700px;
+            width: 100%;
+        }
+        .logo {
+            font-size: 2.8rem;
+            font-weight: 800;
+            margin-bottom: 0.3rem;
+            background: linear-gradient(135deg, #00d4ff, #9d4edd);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .subtitle { color: #888; margin-bottom: 1.5rem; font-size: 1.1rem; }
+        .orb-container {
+            position: relative;
+            width: 180px;
+            height: 180px;
+            margin: 0 auto 1rem;
+        }
+        .orb-ring {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            border-radius: 50%;
+            border: 2px solid rgba(0, 212, 255, 0.2);
+            width: 100%; height: 100%;
+            opacity: 0; transition: opacity 0.3s;
+        }
+        .orb-ring.active { opacity: 1; animation: orbPulse 2s ease-in-out infinite; }
+        @keyframes orbPulse {
+            0%, 100% { transform: translate(-50%, -50%) scale(1); opacity: 0.3; }
+            50% { transform: translate(-50%, -50%) scale(1.3); opacity: 0.1; }
+        }
+        .mic-button {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            width: 120px; height: 120px;
+            border-radius: 50%;
+            border: 3px solid rgba(0, 212, 255, 0.3);
+            background: linear-gradient(135deg, #1a1a2e, #0f3460);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s ease;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            z-index: 10;
+        }
+        .mic-button:hover { transform: translate(-50%, -50%) scale(1.05); }
+        .mic-button.recording {
+            background: linear-gradient(135deg, #e74c3c, #c0392b);
+            border-color: rgba(231, 76, 60, 0.5);
+            box-shadow: 0 0 40px rgba(231, 76, 60, 0.3);
+        }
+        .mic-icon { width: 48px; height: 48px; fill: #00d4ff; }
+        .mic-button.recording .mic-icon { fill: white; }
+
+        .wave-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 3px;
+            height: 40px;
+            margin: 0.5rem 0;
+            opacity: 0; transition: opacity 0.3s;
+        }
+        .wave-container.active { opacity: 1; }
+        .wave-bar {
+            width: 4px;
+            background: linear-gradient(to top, #00d4ff, #9d4edd);
+            border-radius: 2px;
+            transition: height 0.05s ease;
+            min-height: 3px;
+        }
+
+        .status {
+            font-size: 1.1rem;
+            font-weight: 500;
+            color: #aaa;
+            min-height: 2rem;
+            margin-bottom: 0.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+        .status .dot { width: 8px; height: 8px; border-radius: 50%; background: #666; }
+        .status.listening .dot { background: #e74c3c; animation: blink 1s infinite; }
+        .status.thinking .dot { background: #f39c12; animation: blink 0.5s infinite; }
+        .status.speaking .dot { background: #00d4ff; animation: blink 0.8s infinite; }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+        .status.listening { color: #e74c3c; }
+        .status.thinking { color: #f39c12; }
+        .status.speaking { color: #00d4ff; }
+
+        .test-btn {
+            background: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255,255,255,0.15);
+            color: #aaa;
+            padding: 0.6rem 1.2rem;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            margin-bottom: 1rem;
+            transition: all 0.3s;
+        }
+        .test-btn:hover { background: rgba(255,255,255,0.12); color: #fff; }
+        .test-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .conversation {
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 16px;
+            padding: 1.2rem;
+            margin-top: 0.8rem;
+            min-height: 80px;
+            max-height: 250px;
+            overflow-y: auto;
+            text-align: left;
+            display: none;
+        }
+        .conversation.active { display: block; }
+        .msg { margin-bottom: 0.8rem; line-height: 1.5; animation: msgIn 0.3s ease; }
+        @keyframes msgIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+        .msg-you .label { color: #00d4ff; font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; }
+        .msg-hermes .label { color: #9d4edd; font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; }
+        .msg-text { color: #ccc; font-size: 0.95rem; padding-left: 0.3rem; border-left: 2px solid rgba(255,255,255,0.08); }
+
+        .debug-panel {
+            background: rgba(0,0,0,0.3);
+            border-radius: 8px;
+            padding: 0.6rem 1rem;
+            margin-top: 0.8rem;
+            font-size: 0.75rem;
+            color: #666;
+            font-family: monospace;
+            text-align: left;
+            min-height: 1.5rem;
+        }
+        .debug-panel strong { color: #888; }
+
+        .hint { color: #555; font-size: 0.8rem; margin-top: 1rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">🎙️ Voice Chat</div>
+        <p class="subtitle">Hold the button, speak, release — I'll reply with voice</p>
+
+        <button class="test-btn" id="testBtn">🧪 Test Microphone (record 3s, play it back)</button>
+
+        <div class="wave-container" id="waveContainer">
+            <div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div>
+            <div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div>
+            <div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div>
+        </div>
+
+        <div class="orb-container">
+            <div class="orb-ring" id="orbRing"></div>
+            <button class="mic-button" id="micBtn" aria-label="Hold to speak">
+                <svg class="mic-icon" viewBox="0 0 24 24">
+                    <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+                    <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+                </svg>
+            </button>
+        </div>
+
+        <div class="status" id="status">
+            <span class="dot"></span>
+            <span id="statusText">Tap & hold to speak</span>
+        </div>
+
+        <div class="conversation" id="conversation"></div>
+
+        <div class="debug-panel" id="debugPanel"><strong>Debug:</strong> Ready</div>
+
+        <p class="hint">💡 Hold <kbd>Space</kbd> or click & hold the mic · Works with USB mic & speaker</p>
+    </div>
+
+    <script>
+        // ── DOM refs ─────────────────────────────────────
+        const micBtn = document.getElementById('micBtn');
+        const testBtn = document.getElementById('testBtn');
+        const statusEl = document.getElementById('status');
+        const statusText = document.getElementById('statusText');
+        const waveContainer = document.getElementById('waveContainer');
+        const orbRing = document.getElementById('orbRing');
+        const conversation = document.getElementById('conversation');
+        const waveBars = waveContainer.querySelectorAll('.wave-bar');
+        const debugPanel = document.getElementById('debugPanel');
+
+        let audioCtx = null;
+        let inputStream = null;
+        let isRecording = false;
+        let analyser = null;
+        let animId = null;
+        let audioBuffers = [];
+        let recordingType = null; // 'chat' or 'test'
+
+        // ── Utils ────────────────────────────────────────
+        function setStatus(state, text) {
+            statusEl.className = 'status ' + state;
+            statusText.textContent = text;
+        }
+        function debug(msg) {
+            debugPanel.innerHTML = `<strong>Debug:</strong> ${msg}`;
+            console.log('[VoiceChat]', msg);
+        }
+        function updateWaveform() {
+            if (!analyser || !isRecording) return;
+            const data = new Uint8Array(analyser.frequencyBinCount);
+            analyser.getByteFrequencyData(data);
+            const step = Math.floor(data.length / waveBars.length);
+            waveBars.forEach((bar, i) => {
+                bar.style.height = Math.max(3, (data[i * step] / 255) * 100) + '%';
+            });
+            animId = requestAnimationFrame(updateWaveform);
+        }
+
+        // ── Audio capture ───────────────────────────────
+        async function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') {
+                await audioCtx.resume();
+            }
+        }
+
+        async function startCapture(mode) {
+            if (isRecording) return;
+            audioBuffers = [];
+            recordingType = mode;
+            await initAudio();
+
+            try {
+                inputStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: { ideal: 16000 },
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+                debug(`Mic active, sampleRate=${audioCtx.sampleRate}, mode=${mode}`);
+
+                const source = audioCtx.createMediaStreamSource(inputStream);
+                analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 256;
+                analyser.smoothingTimeConstant = 0.8;
+                source.connect(analyser);
+
+                // Use AudioWorklet if available
+                if (audioCtx.audioWorklet) {
+                    const workletCode = `
+                        class Recorder extends AudioWorkletProcessor {
+                            constructor() { super(); this.buffers = []; this.port.onmessage = (e) => {
+                                if (e.data === 'get') { this.port.postMessage({buffers: this.buffers}); this.buffers = []; }
+                            };}
+                            process(inputs) { const input = inputs[0]; if (input && input[0]) { this.buffers.push(new Float32Array(input[0])); } return true; }
+                        }
+                        registerProcessor('recorder', Recorder);
+                    `;
+                    const blob = new Blob([workletCode], { type: 'application/javascript' });
+                    await audioCtx.audioWorklet.addModule(URL.createObjectURL(blob));
+                    const node = new AudioWorkletNode(audioCtx, 'recorder');
+                    source.connect(node);
+                    debug('Using AudioWorklet');
+                    return { type: 'worklet', node, source, sampleRate: audioCtx.sampleRate };
+                } else {
+                    // Legacy ScriptProcessor
+                    const proc = audioCtx.createScriptProcessor(4096, 1, 1);
+                    proc.onaudioprocess = (e) => { audioBuffers.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+                    source.connect(proc);
+                    proc.connect(audioCtx.destination);
+                    debug('Using ScriptProcessorNode');
+                    return { type: 'script', processor: proc, source, sampleRate: audioCtx.sampleRate };
+                }
+            } catch (err) {
+                debug('Mic error: ' + err.message);
+                showError('Microphone error: ' + err.message);
+                return null;
+            }
+        }
+
+        async function stopCapture(recorder) {
+            if (inputStream) inputStream.getTracks().forEach(t => t.stop());
+            cancelAnimationFrame(animId);
+            micBtn.classList.remove('recording');
+            orbRing.classList.remove('active');
+            waveContainer.classList.remove('active');
+            waveBars.forEach(b => b.style.height = '3px');
+
+            // Collect all audio data
+            let rawFloat32;
+            if (recorder.type === 'worklet') {
+                const resp = await new Promise(resolve => {
+                    recorder.node.port.onmessage = (e) => resolve(e.data);
+                    recorder.node.port.postMessage('get');
+                });
+                const bufs = resp.buffers || [];
+                if (bufs.length === 0) { debug('No audio captured (worklet empty)'); return null; }
+                rawFloat32 = concatFloat32(bufs);
+                recorder.node.disconnect();
+            } else {
+                if (audioBuffers.length === 0) { debug('No audio captured (script empty)'); return null; }
+                rawFloat32 = concatFloat32(audioBuffers);
+                recorder.processor.disconnect();
+                recorder.source.disconnect();
+            }
+
+            // Resample to 16000Hz if needed
+            const origRate = recorder.sampleRate;
+            let samples16k = rawFloat32;
+            if (origRate !== 16000) {
+                const ratio = 16000 / origRate;
+                const newLen = Math.floor(rawFloat32.length * ratio);
+                samples16k = new Float32Array(newLen);
+                for (let i = 0; i < newLen; i++) samples16k[i] = rawFloat32[Math.floor(i / ratio)];
+                debug(`Resampled ${rawFloat32.length}@${origRate}Hz → ${newLen}@16000Hz`);
+            }
+            return samples16k;
+        }
+
+        function concatFloat32(arrays) {
+            const total = arrays.reduce((s, a) => s + a.length, 0);
+            const out = new Float32Array(total);
+            let off = 0;
+            for (const a of arrays) { out.set(a, off); off += a.length; }
+            return out;
+        }
+
+        function floatToInt16(samples) {
+            const out = new Int16Array(samples.length);
+            for (let i = 0; i < samples.length; i++) {
+                const s = Math.max(-1, Math.min(1, samples[i]));
+                out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            return out;
+        }
+
+        function encodeWAV(samples, sampleRate, numChannels) {
+            const dataLen = samples.length * 2;
+            const buf = new ArrayBuffer(44 + dataLen);
+            const view = new DataView(buf);
+            const writeStr = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+
+            writeStr(0, 'RIFF');
+            view.setUint32(4, 36 + dataLen, true);
+            writeStr(8, 'WAVE');
+            writeStr(12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);
+            view.setUint16(22, numChannels, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * numChannels * 2, true);
+            view.setUint16(32, numChannels * 2, true);
+            view.setUint16(34, 16, true);
+            writeStr(36, 'data');
+            view.setUint32(40, dataLen, true);
+
+            let off = 44;
+            for (let i = 0; i < samples.length; i++) { view.setInt16(off, samples[i], true); off += 2; }
+            return new Blob([buf], { type: 'audio/wav' });
+        }
+
+        // ── Test Mic ────────────────────────────────────
+        testBtn.addEventListener('click', async () => {
+            if (isRecording) return;
+            testBtn.disabled = true;
+            setStatus('listening', 'Test: Recording 3 seconds...');
+            debug('Test recording started');
+
+            const recorder = await startCapture('test');
+            if (!recorder) { testBtn.disabled = false; return; }
+            isRecording = true;
+            micBtn.classList.add('recording');
+            orbRing.classList.add('active');
+            waveContainer.classList.add('active');
+            updateWaveform();
+
+            // Stop after 3 seconds
+            setTimeout(async () => {
+                isRecording = false;
+                setStatus('thinking', 'Test: Processing...');
+                const samples = await stopCapture(recorder);
+                if (!samples) { setStatus('', 'No audio captured'); testBtn.disabled = false; return; }
+
+                const int16 = floatToInt16(samples);
+                const wavBlob = encodeWAV(int16, 16000, 1);
+                debug(`Test WAV: ${(wavBlob.size/1024).toFixed(1)} KB`);
+
+                // Send to echo endpoint
+                const fd = new FormData();
+                fd.append('audio', wavBlob, 'test.wav');
+                try {
+                    const resp = await fetch('/api/debug/echo', { method: 'POST', body: fd });
+                    const result = await resp.json();
+                    debug(`Echo saved: ${result.echo_url}`);
+
+                    // Play it back!
+                    setStatus('speaking', 'Test: Playing back your voice...');
+                    const audio = new Audio(result.echo_url);
+                    audio.play();
+                    audio.onended = () => {
+                        setStatus('', 'Test complete! Tap mic to chat');
+                        testBtn.disabled = false;
+                        debug('Test complete — if you heard yourself, mic is working');
+                    };
+                } catch (e) {
+                    debug('Echo error: ' + e.message);
+                    setStatus('', 'Test failed');
+                    testBtn.disabled = false;
+                }
+            }, 3000);
+        });
+
+        // ── Chat ────────────────────────────────────────
+        async function startChatRecording() {
+            if (isRecording) return;
+            const recorder = await startCapture('chat');
+            if (!recorder) return;
+            isRecording = true;
+            micBtn.classList.add('recording');
+            orbRing.classList.add('active');
+            waveContainer.classList.add('active');
+            setStatus('listening', 'Listening...');
+            updateWaveform();
+            return recorder;
+        }
+
+        async function stopChatRecording(recorder) {
+            if (!isRecording || !recorder) return;
+            isRecording = false;
+            setStatus('thinking', 'Processing...');
+
+            const samples = await stopCapture(recorder);
+            if (!samples) {
+                setStatus('', 'No audio detected. Try again.');
+                debug('No audio captured');
+                return;
+            }
+
+            const int16 = floatToInt16(samples);
+            const wavBlob = encodeWAV(int16, 16000, 1);
+            debug(`Chat WAV: ${(wavBlob.size/1024).toFixed(1)} KB`);
+
+            const fd = new FormData();
+            fd.append('audio', wavBlob, 'voice.wav');
+            try {
+                const resp = await fetch('/api/chat', { method: 'POST', body: fd });
+                const result = await resp.json();
+                debug(`Server heard: "${result.transcript?.slice(0, 40)}..."`);
+
+                conversation.classList.add('active');
+                const youDiv = document.createElement('div');
+                youDiv.className = 'msg msg-you';
+                youDiv.innerHTML = `<div class="label">🎤 You said</div><div class="msg-text">${escapeHtml(result.transcript || '(unintelligible)')}</div>`;
+                conversation.appendChild(youDiv);
+
+                const hermesDiv = document.createElement('div');
+                hermesDiv.className = 'msg msg-hermes';
+                hermesDiv.innerHTML = `<div class="label">🤖 Hermes replied</div><div class="msg-text">${escapeHtml(result.text)}</div>`;
+                conversation.appendChild(hermesDiv);
+                conversation.scrollTop = conversation.scrollHeight;
+
+                if (result.audio_url) {
+                    setStatus('speaking', 'Speaking...');
+                    const audio = new Audio(result.audio_url);
+                    audio.play().catch(e => console.error('Play error:', e));
+                    audio.onended = () => { setStatus('', 'Tap & hold to speak'); debug('Ready'); };
+                } else {
+                    setStatus('', 'Tap & hold to speak');
+                }
+            } catch (e) {
+                debug('Chat error: ' + e.message);
+                setStatus('', 'Error — try again');
+            }
+        }
+
+        let currentRecorder = null;
+        micBtn.addEventListener('mousedown', async (e) => { e.preventDefault(); currentRecorder = await startChatRecording(); });
+        micBtn.addEventListener('mouseup', () => { stopChatRecording(currentRecorder); currentRecorder = null; });
+        micBtn.addEventListener('mouseleave', () => { if (isRecording) { stopChatRecording(currentRecorder); currentRecorder = null; } });
+        micBtn.addEventListener('touchstart', async (e) => { e.preventDefault(); currentRecorder = await startChatRecording(); });
+        micBtn.addEventListener('touchend', (e) => { e.preventDefault(); stopChatRecording(currentRecorder); currentRecorder = null; });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.code === 'Space' && !isRecording && e.target === document.body) {
+                e.preventDefault(); startChatRecording().then(r => currentRecorder = r);
+            }
+        });
+        document.addEventListener('keyup', (e) => {
+            if (e.code === 'Space' && isRecording) {
+                e.preventDefault(); stopChatRecording(currentRecorder); currentRecorder = null;
+            }
+        });
+
+        function escapeHtml(t) {
+            const d = document.createElement('div');
+            d.textContent = t;
+            return d.innerHTML;
+        }
+        function showError(msg) {
+            const div = document.createElement('div');
+            div.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgba(231,76,60,0.9);color:#fff;padding:12px 20px;border-radius:8px;z-index:9999;font-weight:500;';
+            div.textContent = msg;
+            document.body.appendChild(div);
+            setTimeout(() => div.remove(), 5000);
+        }
+
+        // Browser check
+        if (!navigator.mediaDevices) {
+            showError('Your browser does not support microphone. Use Chrome/Firefox.');
+        }
+    </script>
+</body>
+</html>
