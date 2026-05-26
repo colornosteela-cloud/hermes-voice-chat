@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-TeelaMaster — Vision + Servos + Calibration in One Command
-==========================================================
-Single-entrypoint launcher for all three Teela subsystems.
-Replaces the 3-terminal ZMQ-bus approach with a unified controller.
+TeelaMaster — Unified Robot Controller with Calibration Wizard
+===============================================================
+One command runs everything. Safe, guided calibration discovers
+physical servo limits to prevent mechanical damage.
 
-    python TeelaMaster.py --mode csi --sensor-id 0 --calibrate
-
-Commands (interactive):
-    c   — Run calibration
-    t   — Toggle face tracking ON/OFF
-    s   — Trigger self-calibration sequence
-    q   — Quit
-
-Hardware test (no camera needed):
+Quick test (servos only, no camera):
     python TeelaMaster.py --servo-test --pan-pin 0 --tilt-pin 1
+
+First-time calibration:
+    python TeelaMaster.py --discover-limits --display
+
+Normal run (uses saved limits):
+    python teela/TeelaMaster.py --mode csi --sensor-id 0 --display
+
+Interactive keys during run:
+    c  → Calibrate (uses saved limits if available)
+    l  → Re-discover limits (manual wizard)
+    t  → Toggle tracking
+    q  → Quit
 """
 from __future__ import annotations
 
@@ -22,16 +26,16 @@ import argparse
 import json
 import logging
 import os
-import signal
+import select
 import sys
 import threading
 import time
 import traceback
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 import cv2
 import numpy as np
-import zmq
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -40,10 +44,51 @@ from utils.pca9685_driver import PCA9685
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("TeelaMaster")
 
+CONFIG_PATH = os.path.expanduser("~/.config/teela/calibration.json")
 
-# ── Camera Pipeline ──────────────────────────
 
-def build_gst_pipeline(sensor_id: int = 0, width: int = 1280, height: int = 720, fps: int = 30) -> str:
+# ── Config ───────────────────────────────────
+
+@dataclass
+class ServoLimits:
+    """Discovered hardware limits. Persisted to disk after calibration."""
+    pan_min: float = -80.0   # degrees (logical: -90 left … +90 right)
+    pan_max: float = +80.0
+    tilt_min: float = -30.0  # down (physical danger zone — be cautious)
+    tilt_max: float = +30.0  # up (most dangerous — stop early)
+    pan_center: float = 0.0
+    tilt_center: float = 0.0
+    calibrated: bool = False
+    version: str = "2.0"
+
+    def clamp_pan(self, v: float) -> float:
+        return max(self.pan_min, min(self.pan_max, v))
+
+    def clamp_tilt(self, v: float) -> float:
+        return max(self.tilt_min, min(self.tilt_max, v))
+
+
+def load_limits() -> ServoLimits:
+    if os.path.isfile(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                data = json.load(f)
+            return ServoLimits(**data)
+        except Exception:
+            logger.warning(f"Corrupt calibration file at {CONFIG_PATH}; using defaults.")
+    return ServoLimits()
+
+
+def save_limits(lim: ServoLimits) -> None:
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(asdict(lim), f, indent=2)
+    logger.info(f"Calibration saved to {CONFIG_PATH}")
+
+
+# ── Camera ───────────────────────────────────
+
+def build_gst_pipeline(sensor_id: int, width: int, height: int, fps: int) -> str:
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} ! "
         f"video/x-raw(memory:NVMM),width={width},height={height},format=NV12,framerate={fps}/1 ! "
@@ -54,7 +99,7 @@ def build_gst_pipeline(sensor_id: int = 0, width: int = 1280, height: int = 720,
 
 
 class MockCamera:
-    """Synthetic bouncing rectangle when no real camera is available."""
+    """Synthetic target for headless dev / no-camera testing."""
     def __init__(self, width: int = 640, height: int = 360, fps: int = 30):
         self.width = width
         self.height = height
@@ -98,12 +143,10 @@ class MockCamera:
 # ── Face Detector ────────────────────────────
 
 def find_haarcascade() -> Optional[str]:
-    """Search common Jetson/Ubuntu paths for the frontal face classifier."""
     candidates = [
         "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
         "/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml",
         "/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
-        "/usr/local/share/opencv/haarcascades/haarcascade_frontalface_default.xml",
     ]
     for p in candidates:
         if os.path.isfile(p):
@@ -111,16 +154,9 @@ def find_haarcascade() -> Optional[str]:
     return None
 
 
-# ── Unified Controller ───────────────────────
+# ── Master Controller ───────────────────────
 
 class TeelaMaster:
-    """Brings Vision, Servo Control, and Calibration together in one process.
-
-    Internals run in threads:
-        - _vision_thread   : captures frames, does face detection
-        - _motion_thread   : smooth pan/tilt interpolation to hardware
-    """
-
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self._running = False
@@ -128,32 +164,27 @@ class TeelaMaster:
         self._frame_lock = threading.RLock()
         self._track_mode: str = "idle"
         self._track_lock = threading.Lock()
+        self._last_track_time: float = 0.0
 
-        # State machine
+        self._limits = load_limits()
         self._calibrating: bool = False
         self._calibration_phase: str = "idle"
-        self._cal_start_time: float = 0.0
 
-        # Servo state
         self._pan_current: float = 0.0
         self._tilt_current: float = 0.0
         self._pan_target: float = 0.0
         self._tilt_target: float = 0.0
-        self._lock = threading.RLock()
+        self._motion_lock = threading.RLock()
 
-        # Hardware
         self._cap: Optional[cv2.VideoCapture] = None
         self._pca: Optional[PCA9685] = None
         self._face_cascade: Optional[cv2.CascadeClassifier] = None
 
-        # Threads
         self._vision_thread: Optional[threading.Thread] = None
         self._motion_thread: Optional[threading.Thread] = None
         self._display_thread: Optional[threading.Thread] = None
 
-        logger.info("TeelaMaster initialized.")
-
-    # ── Startup / Shutdown ─────────────────────
+    # ── Lifecycle ────────────────────────────
 
     def start(self) -> None:
         self._running = True
@@ -163,14 +194,11 @@ class TeelaMaster:
 
         self._vision_thread = threading.Thread(target=self._vision_loop, daemon=True)
         self._vision_thread.start()
-
         self._motion_thread = threading.Thread(target=self._motion_loop, daemon=True)
         self._motion_thread.start()
-
         if self.args.display:
             self._display_thread = threading.Thread(target=self._display_loop, daemon=True)
             self._display_thread.start()
-
         logger.info(
             f"Started: camera={self.args.mode} servo={'HW' if self._pca else 'FAKE'} "
             f"face={'ON' if self._face_cascade else 'OFF'}"
@@ -189,76 +217,69 @@ class TeelaMaster:
             cv2.destroyAllWindows()
         logger.info("TeelaMaster stopped.")
 
-    # ── Init ──────────────────────────────────
+    # ── Init ─────────────────────────────────
 
     def _init_camera(self) -> None:
         if self.args.mode == "mock":
             self._cap = MockCamera()
-            logger.info("Using mock camera.")
             return
         if self.args.mode in ("csi", "auto"):
             gst = build_gst_pipeline(self.args.sensor_id, self.args.width, self.args.height, self.args.fps)
-            self._cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
-            if self._cap.isOpened():
-                ret, _ = self._cap.read()
+            cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+            if cap.isOpened():
+                ret, _ = cap.read()
                 if ret:
-                    logger.info(f"CSI camera opened: sensor-id={self.args.sensor_id}")
+                    self._cap = cap
+                    logger.info(f"CSI camera: sensor-id={self.args.sensor_id}")
                     return
-                self._cap.release()
+                cap.release()
             logger.warning("CSI camera failed.")
-            if self.args.mode == "csi":
-                raise RuntimeError("CSI mode requested but camera not available.")
         if self.args.mode in ("usb", "auto"):
-            usb_idx = self.args.usb_device
-            self._cap = cv2.VideoCapture(usb_idx)
-            if self._cap.isOpened():
-                logger.info(f"USB camera opened: /dev/video{usb_idx}")
+            cap = cv2.VideoCapture(self.args.usb_device)
+            if cap.isOpened():
+                self._cap = cap
+                logger.info(f"USB camera: /dev/video{self.args.usb_device}")
                 return
-            logger.warning(f"USB camera /dev/video{usb_idx} failed.")
-            if self.args.mode == "usb":
-                raise RuntimeError("USB mode requested but camera not available.")
-        logger.warning("No real camera found: using mock.")
+            logger.warning(f"USB camera failed.")
+        logger.warning("Using mock camera.")
         self._cap = MockCamera()
 
     def _init_servo_hardware(self) -> None:
-        if self.args.servo_test or not self.args.disable_servos:
-            try:
-                self._pca = PCA9685(bus=7, address=0x40, freq=50)
-                # Center servos on startup
-                self._pan_current = 0.0
-                self._tilt_current = 0.0
-                self._pan_target = 0.0
-                self._tilt_target = 0.0
-                self._write_servo_hardware()
-                logger.info("Servo hardware initialized and centered.")
-            except Exception as e:
-                if self.args.require_servos:
-                    raise RuntimeError(f"Servo hardware required but failed: {e}")
-                logger.warning(f"Servo hardware unavailable: {e}")
-                self._pca = None
+        if self.args.disable_servos:
+            return
+        try:
+            self._pca = PCA9685(bus=7, address=0x40, freq=50)
+            # Center servos
+            self._pan_current = self._limits.pan_center
+            self._tilt_current = self._limits.tilt_center
+            self._pan_target = self._pan_current
+            self._tilt_target = self._tilt_current
+            self._write_hardware()
+            logger.info("Servo hardware initialized and centered.")
+        except Exception as e:
+            if self.args.require_servos:
+                raise
+            logger.warning(f"Servo hardware unavailable: {e}")
 
     def _init_face_detector(self) -> None:
-        cascade_path = find_haarcascade()
-        if cascade_path:
-            self._face_cascade = cv2.CascadeClassifier(cascade_path)
-            logger.info("Face detector loaded.")
+        cp = find_haarcascade()
+        if cp:
+            self._face_cascade = cv2.CascadeClassifier(cp)
+            logger.info("Face detector ready.")
         else:
-            logger.warning(
-                "No haarcascade XML found. Face tracking disabled.\n"
-                "Install: sudo apt install opencv-data"
-            )
+            logger.warning("Face cascade missing; tracking disabled.")
 
     # ── Vision Thread ────────────────────────
 
     def _vision_loop(self) -> None:
-        if self._cap is None:
-            return
         while self._running:
+            if self._cap is None:
+                time.sleep(0.1)
+                continue
             ret, frame = self._cap.read()
             if not ret or frame is None:
                 time.sleep(0.05)
                 continue
-
             with self._frame_lock:
                 self._frame = frame.copy()
 
@@ -271,12 +292,12 @@ class TeelaMaster:
             if mode == "tracking" and self._face_cascade is not None:
                 target = self._detect_face(frame)
                 if target:
-                    with self._lock:
-                        # Convert normalized offset (-1..+1) to servo degrees
-                        # Small gain to avoid aggressive hunting
+                    with self._motion_lock:
                         gain = 30.0
-                        self._pan_target = -target["offset_x"] * gain
-                        self._tilt_target = -target["offset_y"] * gain
+                        tx = -target["offset_x"] * gain
+                        ty = -target["offset_y"] * gain
+                        self._pan_target = self._limits.clamp_pan(tx)
+                        self._tilt_target = self._limits.clamp_tilt(ty)
 
     def _detect_face(self, frame: np.ndarray) -> Optional[dict]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -285,180 +306,253 @@ class TeelaMaster:
         )
         if len(faces) == 0:
             return None
-        best = max(faces, key=lambda fc: fc[2] * fc[3])
-        x, y, w, h = best
+        x, y, w, h = max(faces, key=lambda fc: fc[2] * fc[3])
+        fh, fw = frame.shape[:2]
         cx = x + w // 2
         cy = y + h // 2
-        fh, fw = frame.shape[:2]
+        self._last_track_time = time.time()
         return {
             "offset_x": round((cx / fw - 0.5) * 2.0, 3),
             "offset_y": round((cy / fh - 0.5) * 2.0, 3),
-            "confidence": round(min(1.0, (w * h) / (fw * fh) * 10 + 0.3), 3),
         }
 
-    # ── Motion Thread ─────────────────────────
+    # ── Motion Thread ────────────────────────
 
     def _motion_loop(self) -> None:
-        """Interpolates pan/tilt toward their targets at ~60 Hz."""
         dt = 1.0 / 60.0
         while self._running:
             t0 = time.monotonic()
-
-            with self._lock:
-                # Simple proportional approach (no easing needed for tracking)
-                # Cap max step per frame to avoid jerky movement
-                max_delta = 2.0  # degrees per frame (~120°/s)
-                pan_err = self._pan_target - self._pan_current
-                tilt_err = self._tilt_target - self._tilt_current
-                pan_err = max(-max_delta, min(max_delta, pan_err))
-                tilt_err = max(-max_delta, min(max_delta, tilt_err))
-                self._pan_current += pan_err * self.args.servo_speed
-                self._tilt_current += tilt_err * self.args.servo_speed
-
-                # Clamp to safe limits
-                pc = self._pan_current
-                tc = self._tilt_current
-                pan_min = self.args.pan_min
-                pan_max = self.args.pan_max
-                tilt_min = self.args.tilt_min
-                tilt_max = self.args.tilt_max
-                self._pan_current = max(pan_min, min(pan_max, pc))
-                self._tilt_current = max(tilt_min, min(tilt_max, tc))
-
-                # If calibrating, calibration_phase sets targets directly
-                if self._calibrating:
-                    self._run_calibration_frame()
-
-                self._write_servo_hardware()
-
+            with self._motion_lock:
+                if not self._calibrating:
+                    max_delta = 2.0 * self.args.servo_speed
+                    p_err = max(-max_delta, min(max_delta, self._pan_target - self._pan_current))
+                    t_err = max(-max_delta, min(max_delta, self._tilt_target - self._tilt_current))
+                    self._pan_current += p_err
+                    self._tilt_current += t_err
+                    self._pan_current = self._limits.clamp_pan(self._pan_current)
+                    self._tilt_current = self._limits.clamp_tilt(self._tilt_current)
+                self._write_hardware()
             elapsed = time.monotonic() - t0
-            sleep_for = dt - elapsed
-            if sleep_for > 0:
-                time.sleep(sleep_for)
+            slp = dt - elapsed
+            if slp > 0:
+                time.sleep(slp)
 
-    def _write_servo_hardware(self) -> None:
+    def _write_hardware(self) -> None:
         if self._pca is None:
             return
-        pan_deg = self._pan_current + 90.0
-        tilt_deg = self._tilt_current + 90.0
         try:
-            self._pca.set_servo_angle(self.args.pan_pin, pan_deg)
-            self._pca.set_servo_angle(self.args.tilt_pin, tilt_deg)
+            self._pca.set_servo_angle(self.args.pan_pin, self._pan_current + 90.0)
+            self._pca.set_servo_angle(self.args.tilt_pin, self._tilt_current + 90.0)
         except Exception as e:
-            logger.warning(f"Servo write error: {e}")
+            logger.debug(f"Servo write error: {e}")
 
-    # ── Calibration ──────────────────────────
+    # ── Calibration (safe auto-sweep with saved limits) ──
 
     def trigger_calibration(self) -> None:
-        """Begin the calibration sequence."""
         if self._calibrating:
             logger.warning("Already calibrating.")
             return
+        if not self._limits.calibrated:
+            logger.error("No saved limits! Run --discover-limits first.")
+            print("\n⚠️  First-time calibration required!")
+            print("    Run: python teela/TeelaMaster.py --discover-limits\n")
+            return
         self._calibrating = True
         self._calibration_phase = "start"
-        self._cal_start_time = time.monotonic()
         logger.info("=== CALIBRATION STARTED ===")
-        logger.info("Servos will sweep to limits. Make sure mount has clearance!")
+        logger.info(f"Using limits: pan [{self._limits.pan_min:.0f},{self._limits.pan_max:.0f}] tilt [{self._limits.tilt_min:.0f},{self._limits.tilt_max:.0f}]")
 
     def _run_calibration_frame(self) -> None:
-        """State-machine driven, called inside motion_loop lock."""
         now = time.monotonic()
-        elapsed = now - self._cal_start_time
         phase = self._calibration_phase
 
         if phase == "start":
-            logger.info("[CAL] Phase: PAN_SWEEP LEFT")
-            self._pan_target = self.args.pan_min
-            self._tilt_target = 0.0
+            self._pan_target = self._limits.pan_min
+            self._tilt_target = self._limits.tilt_center
             self._calibration_phase = "pan_left"
             self._phase_start = now
+            logger.info("[CAL] Moving to pan left limit")
 
         elif phase == "pan_left":
-            if elapsed > 2.0:
-                logger.info("[CAL] Phase: PAN_SWEEP RIGHT")
-                self._pan_target = self.args.pan_max
+            if now - self._phase_start > 2.0:
+                self._pan_target = self._limits.pan_max
                 self._calibration_phase = "pan_right"
+                logger.info("[CAL] Moving to pan right limit")
 
         elif phase == "pan_right":
-            if elapsed > 4.0:
-                logger.info("[CAL] Phase: RETURN CENTER")
-                self._pan_target = 0.0
-                self._tilt_target = 0.0
+            if now - self._phase_start > 4.0:
+                self._pan_target = self._limits.pan_center
                 self._calibration_phase = "pan_center"
+                logger.info("[CAL] Returning to pan center")
 
         elif phase == "pan_center":
-            if elapsed > 5.5:
-                logger.info("[CAL] Phase: TILT_SWEEP UP")
-                self._tilt_target = self.args.tilt_max
-                self._calibration_phase = "tilt_up"
-
-        elif phase == "tilt_up":
-            if elapsed > 7.0:
-                logger.info("[CAL] Phase: TILT_SWEEP DOWN")
-                self._tilt_target = self.args.tilt_min
+            if now - self._phase_start > 5.5:
+                self._tilt_target = self._limits.tilt_min
                 self._calibration_phase = "tilt_down"
+                logger.info("[CAL] Moving to tilt down limit")
 
         elif phase == "tilt_down":
-            if elapsed > 8.5:
-                logger.info("[CAL] Phase: HORIZON LOCK")
-                self._tilt_target = 0.0
-                self._pan_target = 0.0
-                self._calibration_phase = "horizon"
+            if now - self._phase_start > 7.0:
+                self._tilt_target = self._limits.tilt_max
+                self._calibration_phase = "tilt_up"
+                logger.info("[CAL] Moving to tilt up limit (watch for clearance!)")
 
-        elif phase == "horizon":
-            if elapsed > 10.0:
-                logger.info("[CAL] Phase: AUDIO-VISUAL CONFIRMATION")
+        elif phase == "tilt_up":
+            if now - self._phase_start > 8.5:
+                self._tilt_target = self._limits.tilt_center
+                self._calibration_phase = "center"
+                logger.info("[CAL] Returning to center")
+
+        elif phase == "center":
+            if now - self._phase_start > 10.0:
+                logger.info("[CAL] Horizon lock + confirmation")
                 self._calibration_phase = "confirm"
-                # Publish / say something
-                logger.info("🎤 'Calibration complete. I am looking at you.'")
-                # In a real system you'd trigger TTS here
-                # For now, just log it
 
         elif phase == "confirm":
-            if elapsed > 11.0:
-                logger.info("[CAL] === CALIBRATION COMPLETE ===")
+            if now - self._phase_start > 12.0:
+                logger.info("🎤 Calibration complete. I am looking at you.")
                 self._calibrating = False
                 self._calibration_phase = "idle"
                 self._track_mode = "tracking"
-                self._pan_target = 0.0
-                self._tilt_target = 0.0
 
-    # ── Display Thread ───────────────────────
+    # ── DISCOVERY WIZARD (manual, step-by-step) ──
+
+    def run_limit_discovery_wizard(self) -> None:
+        """
+        Guided manual calibration. The user slowly drives each axis to its
+        physical limit and presses SPACE when the limit is reached.
+        Tilt UP is done last with tiny steps to prevent damage.
+        """
+        if self._pca is None:
+            logger.error("No servo hardware connected.")
+            return
+
+        print("\n" + "=" * 56)
+        print("  Teela Limit Discovery Wizard")
+        print("=" * 56)
+        print("  This will discover your robot's physical limits.")
+        print("  Move slowly. Press SPACE when a LIMIT is reached.")
+        print("  Press ESC to abort at any time.")
+        print("=" * 56 + "\n")
+
+        lim = ServoLimits()
+
+        # Helper: single-axis discovery
+        def discover_axis(name: str, step: float, start: float,
+                          tiny: bool = False) -> float:
+            """Drive one axis in [step]° increments until user hits SPACE.
+            If tiny=True, asks for confirmation every step.
+            """
+            print(f"\n--- Discovering {name} ---")
+            print(f"  Current step size: {step}° {'(CAUTION MODE)' if tiny else ''}")
+            print("  a = advance  |  SPACE = limit reached  |  ESC = abort\n")
+            angle = start
+            self._move_servo_now(angle, 0.0 if "pan" in name.lower() else None)
+            time.sleep(0.3)
+
+            while True:
+                ch = _getch(timeout=0.05)
+                if ch == " ":
+                    print(f"  ✅ {name} limit recorded: {angle:.1f}°")
+                    return angle
+                if ch == "\x1b" or ch == "\x03":  # ESC or Ctrl+C
+                    raise KeyboardInterrupt("User aborted discovery")
+                if ch == "a":
+                    angle += step
+                    print(f"    Moving {name} → {angle:.1f}°")
+                    if "pan" in name.lower():
+                        self._move_servo_now(angle, self._tilt_current)
+                        self._pan_current = angle
+                    else:
+                        self._move_servo_now(self._pan_current, angle)
+                        self._tilt_current = angle
+
+        try:
+            # 1. Pan left (negative)
+            lim.pan_min = discover_axis("PAN LEFT", step=-3.0, start=0.0)
+
+            # 2. Pan right (positive)
+            lim.pan_max = discover_axis("PAN RIGHT", step=+3.0, start=0.0)
+
+            # 3. Pan center
+            lim.pan_center = (lim.pan_min + lim.pan_max) / 2.0
+            print(f"\n  📐 Pan center calculated: {lim.pan_center:.1f}°")
+            self._move_servo_now(lim.pan_center, self._tilt_current)
+            time.sleep(0.5)
+
+            # 4. Tilt down (negative, generally safe)
+            lim.tilt_min = discover_axis("TILT DOWN", step=-2.0, start=0.0)
+
+            # 5. Tilt UP (most dangerous — tiny steps, extra caution)
+            print("\n" + "⚠️ " * 10)
+            print("  TILT UP is the MOST DANGEROUS direction!")
+            print("  Use TINY steps. Stop BEFORE anything touches.")
+            print("⚠️ " * 10)
+            lim.tilt_max = discover_axis("TILT UP", step=+1.0, start=0.0, tiny=True)
+
+            # 6. Tilt center
+            lim.tilt_center = (lim.tilt_min + lim.tilt_max) / 2.0
+            print(f"\n  📐 Tilt center calculated: {lim.tilt_center:.1f}°")
+
+            # Return to discovered center
+            self._move_servo_now(lim.pan_center, lim.tilt_center)
+            time.sleep(0.5)
+
+            # Save
+            lim.calibrated = True
+            save_limits(lim)
+            self._limits = lim
+
+            print("\n" + "=" * 56)
+            print("  ✅ CALIBRATION SAVED")
+            print(f"  Pan range:  [{lim.pan_min:.0f}° ... {lim.pan_center:.0f}° ... {lim.pan_max:.0f}°]")
+            print(f"  Tilt range: [{lim.tilt_min:.0f}° ... {lim.tilt_center:.0f}° ... {lim.tilt_max:.0f}°]")
+            print("=" * 56 + "\n")
+
+        except KeyboardInterrupt:
+            logger.warning("Discovery aborted by user.")
+            self._move_servo_now(0.0, 0.0)
+
+    def _move_servo_now(self, pan: float, tilt: Optional[float] = None) -> None:
+        if self._pca is None:
+            return
+        if tilt is None:
+            tilt = self._tilt_current
+        self._pan_current = pan
+        self._tilt_current = tilt
+        self._pca.set_servo_angle(self.args.pan_pin, pan + 90.0)
+        self._pca.set_servo_angle(self.args.tilt_pin, tilt + 90.0)
+
+    # ── Display Thread ─────────────────────────
 
     def _display_loop(self) -> None:
-        """OpenCV window with HUD overlay."""
         cv2.namedWindow("Teela", cv2.WINDOW_AUTOSIZE)
         font = cv2.FONT_HERSHEY_SIMPLEX
         while self._running:
             with self._frame_lock:
                 frame = self._frame.copy() if self._frame is not None else None
-
             if frame is None:
                 cv2.waitKey(50)
                 continue
-
             fh, fw = frame.shape[:2]
             color = (0, 255, 0)
-
-            # Draw crosshair
             cx, cy = fw // 2, fh // 2
             cv2.line(frame, (cx - 20, cy), (cx + 20, cy), color, 1)
             cv2.line(frame, (cx, cy - 20), (cx, cy + 20), color, 1)
 
-            # HUD
-            with self._lock:
+            with self._motion_lock:
                 hud = [
                     f"PAN: {self._pan_current:+.1f}°",
                     f"TILT: {self._tilt_current:+.1f}°",
                     f"TRACK: {self._track_mode.upper()}",
                     f"CAL: {self._calibration_phase if self._calibrating else 'IDLE'}",
+                    f"LIMITS: {'SAVED' if self._limits.calibrated else 'NOT CONFIGURED'}",
                 ]
             y = 20
             for line in hud:
                 cv2.putText(frame, line, (10, y), font, 0.5, color, 1)
                 y += 20
 
-            # Draw tracking target if available
             if self._track_mode == "tracking":
                 tx = int(cx - self._pan_current * 3)
                 ty = int(cy - self._tilt_current * 3)
@@ -468,109 +562,110 @@ class TeelaMaster:
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 self._running = False
                 break
-
         cv2.destroyAllWindows()
 
-    # ── Servo Test ───────────────────────────
+    # ── Interactive Control ──────────────────
 
-    def servo_sweep(self) -> None:
-        """Immediate sweep test — useful before running full system."""
+    def interactive(self) -> None:
+        print("\n╔═══════════════════════════════════════╗")
+        print("║  Teela Master Controller            ║")
+        print("╠═══════════════════════════════════════╣")
+        print("║  c  → Calibrate (auto-sweep)          ║")
+        print("║  l  → Discover limits (manual wizard) ║")
+        print("║  t  → Toggle face tracking            ║")
+        print("║  q  → Quit                            ║")
+        print("╚═══════════════════════════════════════╝\n")
+
+        while self._running:
+            ch = _getch(timeout=0.1)
+            if not ch:
+                continue
+            if ch == "c":
+                self.trigger_calibration()
+            elif ch == "l":
+                self.run_limit_discovery_wizard()
+            elif ch == "t":
+                with self._track_lock:
+                    self._track_mode = "idle" if self._track_mode == "tracking" else "tracking"
+                    logger.info(f"Tracking: {'ON' if self._track_mode == 'tracking' else 'OFF'}")
+            elif ch == "q":
+                self._running = False
+            elif ch == "\x1b" or ch == "\x03":
+                self._running = False
+
+    # ── Servo sweep (quick hardware check) ───
+
+    def servo_sweep_test(self) -> None:
         if self._pca is None:
-            logger.error("No servo hardware. Install PCA9685 and check I2C.")
+            logger.error("No servo hardware.")
             return
-        logger.info("Servo sweep test starting...")
-        for angle in range(0, 181, 30):
-            self._pca.set_servo_angle(self.args.pan_pin, angle)
+        logger.info("Sweeping pan servo...")
+        for a in range(0, 181, 30):
+            self._pca.set_servo_angle(self.args.pan_pin, a)
             time.sleep(0.4)
-        for angle in range(180, -1, -30):
-            self._pca.set_servo_angle(self.args.pan_pin, angle)
+        for a in range(180, -1, -30):
+            self._pca.set_servo_angle(self.args.pan_pin, a)
             time.sleep(0.4)
         self._pca.set_servo_angle(self.args.pan_pin, 90)
         logger.info("Sweep complete.")
 
-    # ── Interactive CLI ──────────────────────
 
-    def interactive(self) -> None:
-        """Blocking. Reads stdin for single-char commands."""
-        print("\n═══════════════════════════════════════")
-        print("  Teela Master Controller")
-        print("═══════════════════════════════════════")
-        print("  c  →  Calibrate (servo sweep)")
-        print("  t  →  Toggle face tracking")
-        print("  s  →  Sweep servos (test only)")
-        print("  q  →  Quit")
-        print("═══════════════════════════════════════\n")
+# ── Raw single-char stdin helper ───────────
 
-        try:
-            import tty, termios
-            old = termios.tcgetattr(sys.stdin)
-            tty.setcbreak(sys.stdin.fileno())
-        except Exception:
-            old = None  # Will fall back to input()
-
-        try:
-            while self._running:
-                if old:
-                    import select
-                    if select.select([sys.stdin], [], [], 0.2)[0]:
-                        ch = sys.stdin.read(1)
-                    else:
-                        continue
-                else:
-                    ch = input().strip().lower()
-
-                if ch == "c":
-                    self.trigger_calibration()
-                elif ch == "t":
-                    with self._track_lock:
-                        if self._track_mode == "tracking":
-                            self._track_mode = "idle"
-                            logger.info("Tracking: OFF")
-                        else:
-                            self._track_mode = "tracking"
-                            logger.info("Tracking: ON")
-                elif ch == "s":
-                    self.servo_sweep()
-                elif ch == "q":
-                    self._running = False
-        finally:
-            if old:
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+def _getch(timeout: float = 0.0) -> Optional[str]:
+    """Read a single character from stdin without Enter. Returns None if no input."""
+    fd = sys.stdin.fileno()
+    try:
+        import tty, termios
+        old = termios.tcgetattr(fd)
+        tty.setraw(fd)
+    except Exception:
+        old = None
+    try:
+        if timeout > 0:
+            ready, _, _ = select.select([sys.stdin], [], [], timeout)
+            if not ready:
+                return None
+        ch = sys.stdin.read(1)
+        return ch
+    except Exception:
+        return None
+    finally:
+        if old:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 # ── CLI ──────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(description="TeelaMaster — Unified Robot Controller")
-    parser.add_argument("--mode", choices=["csi", "usb", "mock", "auto"], default="auto",
-                        help="Camera mode")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="TeelaMaster — Unified Controller")
+    parser.add_argument("--mode", choices=["csi", "usb", "mock", "auto"], default="auto")
     parser.add_argument("--sensor-id", type=int, default=0)
     parser.add_argument("--usb-device", type=int, default=0)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--display", action="store_true", help="Show OpenCV window")
-    parser.add_argument("--calibrate", action="store_true", help="Run calibration immediately")
-    parser.add_argument("--servo-test", action="store_true", help="Only sweep servos and exit")
+    parser.add_argument("--display", action="store_true")
+    parser.add_argument("--calibrate", action="store_true", help="Auto-sweep calibration")
+    parser.add_argument("--discover-limits", action="store_true", help="Manual limit discovery wizard")
+    parser.add_argument("--servo-test", action="store_true", help="Quick servo sweep and exit")
     parser.add_argument("--pan-pin", type=int, default=0)
     parser.add_argument("--tilt-pin", type=int, default=1)
     parser.add_argument("--pan-min", type=float, default=-80.0)
-    parser.add_argument("--pan-max", type=float, default=+80.0)
-    parser.add_argument("--tilt-min", type=float, default=-45.0)
-    parser.add_argument("--tilt-max", type=float, default=+45.0)
-    parser.add_argument("--servo-speed", type=float, default=0.15,
-                        help="Tracking response speed (0-1, lower=slower)")
+    parser.add_argument("--pan-max", type=float, default=80.0)
+    parser.add_argument("--tilt-min", type=float, default=-30.0)
+    parser.add_argument("--tilt-max", type=float, default=30.0)
+    parser.add_argument("--servo-speed", type=float, default=0.15)
     parser.add_argument("--disable-servos", action="store_true")
     parser.add_argument("--require-servos", action="store_true")
     args = parser.parse_args()
 
     master = TeelaMaster(args)
 
-    # Quick servo-only test
     if args.servo_test:
         try:
             master._init_servo_hardware()
-            master.servo_sweep()
+            master.servo_sweep_test()
         except Exception as e:
             logger.error(f"Servo test failed: {e}")
             sys.exit(1)
@@ -579,14 +674,22 @@ def main():
                 master._pca.deinit()
         sys.exit(0)
 
-    # Normal startup
-    master.start()
+    if args.discover_limits:
+        try:
+            master._init_servo_hardware()
+            master.run_limit_discovery_wizard()
+        except Exception as e:
+            logger.error(f"Discovery failed: {e}")
+            traceback.print_exc()
+        finally:
+            if master._pca:
+                master._pca.deinit()
+        sys.exit(0)
 
+    master.start()
     if args.calibrate:
         time.sleep(1.0)
         master.trigger_calibration()
-
-    print("\nPress 'c' to calibrate, 't' to toggle tracking, 'q' to quit.\n")
 
     try:
         master.interactive()
@@ -594,8 +697,4 @@ def main():
         pass
     finally:
         master.stop()
-        logger.info("Goodbye.")
-
-
-if __name__ == "__main__":
-    main()
+        logger.info("Shutdown complete.")
