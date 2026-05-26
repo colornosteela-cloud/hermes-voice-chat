@@ -844,6 +844,8 @@ if __name__ == "__main__":
     parser.add_argument("--calibrate", action="store_true", help="Auto-sweep calibration")
     parser.add_argument("--discover-limits", action="store_true", help="Manual limit discovery wizard")
     parser.add_argument("--servo-test", action="store_true", help="Quick servo sweep and exit")
+    parser.add_argument("--auto-cal-pan", action="store_true",
+                        help="Run vision-based automatic pan limit detection and exit")
     parser.add_argument("--pan-pin", type=int, default=0)
     parser.add_argument("--tilt-pin", type=int, default=1)
     parser.add_argument("--invert-pan", action="store_true",
@@ -883,6 +885,21 @@ if __name__ == "__main__":
         finally:
             if master._pca:
                 master._pca.deinit()
+        sys.exit(0)
+
+    if args.auto_cal_pan:
+        try:
+            master._init_camera()
+            master._init_servo_hardware()
+            master.auto_calibrate_pan()
+        except Exception as e:
+            logger.error(f"Auto-cal failed: {e}")
+            traceback.print_exc()
+        finally:
+            if master._pca:
+                master._pca.deinit()
+            if master._cap:
+                master._cap.release()
         sys.exit(0)
 
     master.start()
