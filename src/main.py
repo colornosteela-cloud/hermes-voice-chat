@@ -185,11 +185,33 @@ async def root():
 
 @app.post("/api/chat")
 async def api_chat(audio: UploadFile = File(...)):
+    raw_bytes = b""
     try:
         raw_bytes = await audio.read()
         print(f"[API] Received {len(raw_bytes)} bytes from browser")
         
+        # Validate it is actually a WAV
+        if len(raw_bytes) < 44 or raw_bytes[:4] != b'RIFF':
+            print(f"[API] WARNING: Not a valid WAV (first 4 bytes: {raw_bytes[:4]})")
+            # Save it anyway for inspection
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            bad_path = AUDIO_DIR / f"bad_format_{ts}.bin"
+            bad_path.write_bytes(raw_bytes)
+            print(f"[API] Saved bad format to {bad_path}")
+        else:
+            # Parse WAV header for diagnostics
+            try:
+                fmt_off = raw_bytes.find(b'fmt ')
+                if fmt_off != -1:
+                    sr = struct.unpack('<I', raw_bytes[fmt_off+12:fmt_off+16])[0]
+                    bits = struct.unpack('<H', raw_bytes[fmt_off+14:fmt_off+16])[0]
+                    ch = struct.unpack('<H', raw_bytes[fmt_off+10:fmt_off+12])[0]
+                    print(f"[API] WAV: {sr}Hz, {ch}ch, {bits}bit, {len(raw_bytes)} bytes")
+            except Exception:
+                pass
+        
         transcript = await transcribe_wav(raw_bytes)
+        print(f"[API] Transcript: '{transcript}'")
         if not transcript:
             return JSONResponse({
                 "transcript": "",
@@ -211,6 +233,12 @@ async def api_chat(audio: UploadFile = File(...)):
         print(f"[API] ERROR: {e}")
         import traceback
         traceback.print_exc()
+        # Save the problematic audio for debugging
+        if raw_bytes:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            bad_path = AUDIO_DIR / f"error_{ts}.wav"
+            bad_path.write_bytes(raw_bytes)
+            print(f"[API] Saved error audio to {bad_path}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/audio/{filename}")
