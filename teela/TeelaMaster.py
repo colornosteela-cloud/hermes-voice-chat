@@ -364,7 +364,198 @@ class TeelaMaster:
         logger.info("=== CALIBRATION STARTED ===")
         logger.info(f"Using limits: pan [{self._limits.pan_min:.0f},{self._limits.pan_max:.0f}] tilt [{self._limits.tilt_min:.0f},{self._limits.tilt_max:.0f}]")
 
+    # ── Vision-Based AUTO Calibration ───────
+
+    def auto_calibrate_pan(self) -> None:
+        """
+        Automatic pan limit detection using camera feedback.
+        Slowly sweeps left and right, watching the camera image.
+        When the servo hits a mechanical limit, pixels stop changing → we detect it.
+        """
+        if self._pca is None:
+            logger.error("No servo hardware for auto-calibration.")
+            return
+        if self._cap is None:
+            logger.error("No camera for auto-calibration.")
+            return
+
+        print("\n========================================")
+        print("  Auto Pan Calibration (Vision)        ")
+        print("========================================")
+        print("  Moving to mechanical limits...")
+        print("  Camera is watching for motion.        \n")
+
+        def detect_motion_stopped(reference_frame: np.ndarray,
+                                   angle: float, direction: str,
+                                   step: float = 1.0,
+                                   timeout: float = 10.0,
+                                   motion_threshold: float = 3.0) -> float:
+            """Move in [direction] until pixels stop changing. Returns limit angle."""
+            logger.info(f"  [AUTO CAL] Starting {direction} sweep...")
+            start_time = time.monotonic()
+            current_angle = angle
+            self._move_servo_now(current_angle, 0.0)
+            time.sleep(0.3)
+
+            while time.monotonic() - start_time < timeout:
+                # Move one step
+                current_angle += step
+                self._move_servo_now(current_angle, 0.0)
+                time.sleep(0.2)  # give servo time to move
+
+                # Get fresh frame
+                ret, frame = self._cap.read()
+                if not ret or frame is None:
+                    continue
+
+                # Compare difference
+                gray_ref = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2GRAY)
+                gray_now = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                diff = cv2.absdiff(gray_ref, gray_now)
+                mean_diff = np.mean(diff)
+
+                # If pixels barely changed, servo stopped moving (hit limit)
+                if mean_diff < motion_threshold:
+                    logger.info(f"  [AUTO CAL] {direction} limit detected at {current_angle:.1f}° (motion={mean_diff:.1f})")
+                    return current_angle
+
+                # Update reference for next iteration
+                reference_frame = frame.copy()
+
+                if int(current_angle) % 10 == 0:
+                    logger.info(f"    {direction}: {current_angle:.0f}°, motion={mean_diff:.1f}")
+
+            logger.warning(f"  [AUTO CAL] {direction} sweep hit timeout. Last angle: {current_angle:.1f}°")
+            return current_angle
+
+        # ── Sweep LEFT ──
+        ret, ref_frame = self._cap.read()
+        if not ret or ref_frame is None:
+            logger.error("Camera not providing frames.")
+            return
+
+        # Start from assumed center
+        pan_left = detect_motion_stopped(
+            reference_frame=ref_frame,
+            angle=0.0,
+            direction="LEFT",
+            step=-1.0,
+            motion_threshold=5.0
+        )
+        print(f"  ✅ PAN LEFT  limit: {pan_left:.1f}°")
+
+        # ── Sweep RIGHT ──
+        # Need a new reference frame looking from the left position
+        self._move_servo_now(pan_left + 5.0, 0.0)  # Back off slightly
+        time.sleep(0.3)
+        ret, ref_frame = self._cap.read()
+        if not ret:
+            ref_frame = None
+        if ref_frame is not None:
+            cv2.resize(ref_frame, (ref_frame.shape[1]//2, ref_frame.shape[0]//2))  # warm cache
+
+        # Re-center before going right
+        self._move_servo_now(0.0, 0.0)
+        time.sleep(0.3)
+        ret, ref_frame = self._cap.read()
+        if not ret:
+            ref_frame = np.zeros((360, 640, 3), dtype=np.uint8)
+
+        pan_right = detect_motion_stopped(
+            reference_frame=ref_frame,
+            angle=0.0,
+            direction="RIGHT",
+            step=+1.0,
+            motion_threshold=5.0
+        )
+        print(f"  ✅ PAN RIGHT limit: {pan_right:.1f}°")
+
+        # ── Calculate center ──
+        pan_center = (pan_left + pan_right) / 2.0
+        print(f"  📐 CENTER: {pan_center:.1f}°")
+
+        # Save to limits
+        self._limits.pan_min = pan_left
+        self._limits.pan_max = pan_right
+        self._limits.pan_center = pan_center
+
+        # ── Tilt (manual — too dangerous to automate) ──
+        print("\n  Tilt limits must be set manually.")
+        print("  Run --discover-limits for full calibration.\n")
+        print("  Default tilt limits used: [-30°, +30°]")
+
+        self._limits.tilt_min = -30.0
+        self._limits.tilt_max = +30.0
+        self._limits.tilt_center = 0.0
+        self._limits.calibrated = True
+        save_limits(self._limits)
+        self._limits = self._limits
+
+        # Return to center
+        self._move_servo_now(pan_center, 0.0)
+        time.sleep(0.3)
+
+        print("  ✅ Auto-calibration saved!")
+        print(f"  Pan range: [{pan_left:.0f} ... {pan_center:.0f} ... {pan_right:.0f}]")
+        print("========================================\n")
+
+    # ── Time-based calibration sweep ──────────
+
     def _run_calibration_frame(self) -> None:
+        """Runs inside motion_loop during calibration phase. Time-based sweep."""
+        now = time.monotonic()
+        phase = self._calibration_phase
+
+        if phase == "start":
+            self._pan_target = self._limits.pan_min
+            self._tilt_target = self._limits.tilt_center
+            self._calibration_phase = "pan_left"
+            self._phase_start = now
+            logger.info("[CAL] Moving to pan left limit")
+
+        elif phase == "pan_left":
+            if now - self._phase_start > 2.0:
+                self._pan_target = self._limits.pan_max
+                self._calibration_phase = "pan_right"
+                logger.info("[CAL] Moving to pan right limit")
+
+        elif phase == "pan_right":
+            if now - self._phase_start > 4.0:
+                self._pan_target = self._limits.pan_center
+                self._calibration_phase = "pan_center"
+                logger.info("[CAL] Returning to pan center")
+
+        elif phase == "pan_center":
+            if now - self._phase_start > 5.5:
+                self._tilt_target = self._limits.tilt_min
+                self._calibration_phase = "tilt_down"
+                logger.info("[CAL] Moving to tilt down limit")
+
+        elif phase == "tilt_down":
+            if now - self._phase_start > 7.0:
+                self._tilt_target = self._limits.tilt_max
+                self._calibration_phase = "tilt_up"
+                logger.info("[CAL] Moving to tilt up limit (watch for clearance!)")
+
+        elif phase == "tilt_up":
+            if now - self._phase_start > 8.5:
+                self._tilt_target = self._limits.tilt_center
+                self._calibration_phase = "center"
+                logger.info("[CAL] Returning to center")
+
+        elif phase == "center":
+            if now - self._phase_start > 10.0:
+                logger.info("[CAL] Horizon lock + confirmation")
+                self._calibration_phase = "confirm"
+
+        elif phase == "confirm":
+            if now - self._phase_start > 12.0:
+                logger.info("🎤 Calibration complete. I am looking at you.")
+                self._calibrating = False
+                self._calibration_phase = "idle"
+                self._track_mode = "tracking"
+
+    # ── DISCOVERY WIZARD (manual, step-by-step) ──
         now = time.monotonic()
         phase = self._calibration_phase
 
