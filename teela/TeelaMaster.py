@@ -387,43 +387,57 @@ class TeelaMaster:
 
         def detect_motion_stopped(reference_frame: np.ndarray,
                                    angle: float, direction: str,
-                                   step: float = 1.0,
-                                   timeout: float = 10.0,
-                                   motion_threshold: float = 3.0) -> float:
+                                   step: float = 3.0,
+                                   timeout: float = 60.0,
+                                   confirm_frames: int = 3) -> float:
             """Move in [direction] until pixels stop changing. Returns limit angle."""
-            logger.info(f"  [AUTO CAL] Starting {direction} sweep...")
+            logger.info(f"  [AUTO CAL] Starting {direction} sweep (step={step}°)...")
             start_time = time.monotonic()
             current_angle = angle
             self._move_servo_now(current_angle, 0.0)
             time.sleep(0.3)
 
+            # Store the ORIGINAL reference (before movement)
+            ret, ref_frame = self._cap.read()
+            if not ret or ref_frame is None:
+                ref_frame = reference_frame.copy()
+            else:
+                reference_frame = ref_frame.copy()
+            gray_ref = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2GRAY)
+
+            low_motion_frames = 0
+            last_report_angle = angle
+
             while time.monotonic() - start_time < timeout:
                 # Move one step
                 current_angle += step
                 self._move_servo_now(current_angle, 0.0)
-                time.sleep(0.2)  # give servo time to move
+                time.sleep(0.3)  # give servo time to move (+ frame read)
 
                 # Get fresh frame
                 ret, frame = self._cap.read()
                 if not ret or frame is None:
                     continue
 
-                # Compare difference
-                gray_ref = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2GRAY)
+                # Compare difference against ORIGINAL reference
                 gray_now = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 diff = cv2.absdiff(gray_ref, gray_now)
                 mean_diff = np.mean(diff)
 
-                # If pixels barely changed, servo stopped moving (hit limit)
-                if mean_diff < motion_threshold:
-                    logger.info(f"  [AUTO CAL] {direction} limit detected at {current_angle:.1f}° (motion={mean_diff:.1f})")
-                    return current_angle
-
-                # Update reference for next iteration
-                reference_frame = frame.copy()
-
-                if int(current_angle) % 10 == 0:
+                if int(current_angle) != int(last_report_angle) and int(current_angle) % 10 == 0:
                     logger.info(f"    {direction}: {current_angle:.0f}°, motion={mean_diff:.1f}")
+                    last_report_angle = current_angle
+
+                # If pixels barely changed compared to original, servo stopped
+                if mean_diff < 15.0:  # threshold tuned for noise
+                    low_motion_frames += 1
+                    if low_motion_frames >= confirm_frames:
+                        logger.info(f"  [AUTO CAL] {direction} limit detected at {current_angle:.1f}° (motion={mean_diff:.1f}, confirmed)")
+                        return current_angle
+                else:
+                    low_motion_frames = 0
+                    # Reset reference when movement is normal
+                    gray_ref = gray_now.copy()
 
             logger.warning(f"  [AUTO CAL] {direction} sweep hit timeout. Last angle: {current_angle:.1f}°")
             return current_angle
@@ -439,8 +453,7 @@ class TeelaMaster:
             reference_frame=ref_frame,
             angle=0.0,
             direction="LEFT",
-            step=-1.0,
-            motion_threshold=5.0
+            step=-3.0
         )
         print(f"  ✅ PAN LEFT  limit: {pan_left:.1f}°")
 
@@ -465,8 +478,7 @@ class TeelaMaster:
             reference_frame=ref_frame,
             angle=0.0,
             direction="RIGHT",
-            step=+1.0,
-            motion_threshold=5.0
+            step=+3.0
         )
         print(f"  ✅ PAN RIGHT limit: {pan_right:.1f}°")
 
