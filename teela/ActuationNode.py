@@ -90,23 +90,28 @@ class ServoConfig:
 class FakeServo:
     """Silently mirrors what a real PCA9685 servo would do."""
     def __init__(self, pin: int, name: str):
-        self.pin = pin
-        self.name = name
-        self.angle = 0.0
+        super().__setattr__("pin", pin)
+        super().__setattr__("name", name)
+        super().__setattr__("angle", 0.0)
 
     def setPulse(self, micros: int):
         # Map 1000-2000 µs → -90..+90 roughly; just store for debug
-        self.angle = (micros - 1500) / 500 * 45  # rough
+        val = (micros - 1500) / 500 * 45
+        super().__setattr__("angle", val)
     
-    def angle_setter(self, x):
-        ""
     def __setattr__(self, name, value):
         if name == "angle":
-            self.angle = value
+            super().__setattr__("angle", value)
             logger.debug(f"[{self.name}] set to {value:.1f}°")
         else:
             super().__setattr__(name, value)
 
+    def __setitem__(self, key, value):
+        """Allow kit.servo[n].angle = x style assignment."""
+        if key == "angle":
+            self.__setattr__("angle", value)
+        else:
+            super().__setattr__(key, value)
 
 # ────────────────────────────────────────────────
 # Actuation Node
