@@ -1,142 +1,254 @@
-# 🎙️ Hermes Voice Chat v1.0.0
+# 🎙️ Hermes Voice Chat + 🤖 Teela Robotics
 
-A **standalone voice-only chat interface** for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — no typing needed. Hold the mic button, speak naturally, and hear AI responses through an emotionally intelligent voice.
+**v2.0.0** | [Roni](https://github.com/colornosteela-cloud)
 
-Built for **ARM64/Jetson** devices, works on any Linux machine with a USB microphone and speaker.
+A unified conversational robotics platform built for **NVIDIA Jetson** — voice-enabled AI chat **plus** real-time vision-servo synchronization for embodied agents.
 
 ---
 
-## ✨ Features
+## 🗂️ Two Subsystems, One Platform
+
+This repository contains **two complementary systems** that share a ZeroMQ messaging backbone:
+
+| Subsystem | Location | What it does |
+|-----------|----------|--------------|
+| 🎙️ **Hermes Voice Chat** | `src/` | Voice-only chat interface — hold to talk, AI replies with emotional voice |
+| 🤖 **Teela Robotics** | `teela/` | Vision-kinematic-servo sync — face tracking, pan/tilt head, calibration |
+
+---
+
+## 🎙️ Subsystem 1: Voice Chat
+
+A **standalone voice-only chat interface** for [Hermes Agent](https://github.com/NousResearch/hermes-agent). No typing needed — just hold and speak.
+
+### ✨ Features
 
 | Feature | Description |
 |---------|-------------|
 | 🎤 **Voice Input** | Click & hold to record, release to send |
-| 🗣️ **Emotional Voice Output** | Hume Octave TTS — speaks with genuine feeling |
-| 🧠 **Local LLM** | Connects to Ollama for fully private inference |
-| 🧪 **Mic Test Button** | Built-in test to verify microphone works |
-| 📱 **Mobile Friendly** | Touch-friendly UI |
-| 🔒 **Privacy First** | Speech-to-Text runs locally via faster-whisper |
+| 🗣️ **Emotional TTS** | Hume Octave — genuine emotional voice |
+| 🧠 **Local LLM** | Ollama for fully private inference |
+| 🧪 **Mic Test** | Built-in 3-second echo test |
+| 📱 **Mobile Friendly** | Touch-friendly dark UI |
+| 🔒 **Privacy First** | STT via faster-whisper (on-device) |
+
+### 🚀 Quick Start
+
+```bash
+# Setup
+git clone https://github.com/colornosteela-cloud/hermes-voice-chat.git
+cd hermes-voice-chat
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+
+# Configure
+cp .env.example .env
+# Edit .env with HUME_API_KEY, OLLAMA_BASE_URL, etc.
+
+# Launch
+python src/main.py
+# Open http://localhost:8765
+```
+
+### 📁 Files
+
+```
+src/
+├── main.py          # FastAPI backend (249 lines)
+└── index.html       # Voice-only web UI (400+ lines)
+```
 
 ---
 
-## 🚀 Quick Start
+## 🤖 Subsystem 2: Teela Robotics
+
+Real-time **vision-kinematic synchronization** for a 2-axis robotic head. Teela tracks faces with a CSI camera, centers them via smooth servo motion, and runs a full calibration routine on voice command.
+
+### ✨ Features
+
+| Feature | Description |
+|---------|-------------|
+| 📷 **CSI Vision** | Jetson `nvarguscamerasrc` GStreamer pipeline, face tracking |
+| 🔧 **Pan/Tilt Servos** | PCA9685 I2C PWM with eased cubic/sine interpolation |
+| 🎯 **Visual Tracking** | Proportional correction from pixel offsets to servo angles |
+| 🗣️ **Voice Calibration** | Say *"calibrate"* → full audio-visual-kinematic alignment |
+| 🛡️ **Headless Mode** | FakeServo + V4L2 fallback for dev without hardware |
+| 📡 **ZMQ Bus** | Mini-ROS pattern: `/voice/intent`, `/vision/tracking`, `/motor/*` |
+
+### 🚀 Quick Start (3 terminals)
 
 ```bash
-# 1. Clone and setup
-git clone https://github.com/colornosteela-cloud/hermes-voice-chat.git
-cd hermes-voice-chat
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+# Terminal 1 — Vision pipeline
+python teela/VisionNode.py --zmq-pub tcp://127.0.0.1:5555 --display
 
-# 2. Configure
-cp .env.example .env
-# Edit .env with your HUME_API_KEY and HUME_VOICE_ID
+# Terminal 2 — Servo actuation
+python teela/ActuationNode.py --zmq-sub tcp://127.0.0.1:5555 --pan-pin 0 --tilt-pin 1
 
-# 3. Start
-python src/main.py
+# Terminal 3 — Calibration orchestrator
+python teela/CalibrationStateMachine.py --zmq-pub tcp://127.0.0.1:5555 --zmq-sub tcp://127.0.0.1:5556
+```
 
-# 4. Open browser
-# http://localhost:8765
+### 📁 Files
+
+```
+teela/
+├── VisionNode.py              # CSI capture, face tracking, ZMQ publisher
+├── ActuationNode.py           # Pan/tilt servo control with easing
+├── CalibrationStateMachine.py # Voice-triggered calibration sequence
+├── ZMQ_Schemas.py             # Shared message schemas + validators
+└── README.md                  # Detailed Teela architecture docs
+```
+
+### 🎯 Calibration Sequence
+
+1. **Kinematic Boundary Sweep** — Pan ±90°, Tilt ±45°
+2. **Return to Center** — Guaranteed (0°, 0°)
+3. **Visual Horizon** — AWB lock, frame stability check
+4. **Audio-Visual Confirm** — Status `"Ready"` → voice: *"Calibration complete, I am looking at you."*
+
+---
+
+## 🔌 Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    HERMES VOICE CHAT                            │
+│                    + TEELA ROBOTICS                             │
+│                                                                 │
+│    🎤 Voice Chat Frontend                                      │
+│    (Browser @ localhost:8765)                                    │
+│         │                                                       │
+│         │  HTTP + WebRTC → FastAPI                              │
+│         ▼                                                       │
+│    ┌──────────┐   ┌──────────┐    ┌──────────┐   ┌────────┐  │
+│    │  API     │──►│  Hermes  │◄──►│  Ollama  │   │  Hume  │  │
+│    │  Server  │   │  Agent   │    │  (LLM)   │   │  (TTS) │  │
+│    └────┬─────┘   └──────────┘    └──────────┘   └────────┘  │
+│         │                                                       │
+│         │  ZMQ pub/sub bus                                      │
+│         ▼                                                       │
+│    ┌────────────────────────────────────────────────────────┐  │
+│    │              TEELA VISION + KINEMATICS                 │  │
+│    │  ┌─────────────┐      ┌───────────────┐    ┌────────┐  │  │
+│    │  │ VisionNode  │◄────►│ Calibration   │◄──►│ Voice  │  │  │
+│    │  │ (CSI + cv2) │      │ StateMachine  │    │ Sync   │  │  │
+│    │  └──────┬──────┘      └──────┬────────┘    └────────┘  │  │
+│    │         │                    │                          │  │
+│    │    /vision/tracking ────────►│                          │  │
+│    │         │                    ▼                          │  │
+│    │  ┌─────────────────────────────────────────────────┐   │  │
+│    │  │           ActuationNode                        │   │  │
+│    │  │  (Pan/Tilt servos via I2C/PCA9685)            │   │  │
+│    │  └─────────────────────────────────────────────────┘   │  │
+│    └────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 📦 Full File Tree
+
+```
+hermes-voice-chat/
+├── src/
+│   ├── main.py              # Voice Chat FastAPI backend
+│   └── index.html           # Voice Chat browser UI
+├── teela/
+│   ├── VisionNode.py        # CSI camera + face tracking
+│   ├── ActuationNode.py     # Pan/tilt servo control
+│   ├── CalibrationStateMachine.py  # Voice-triggered calibration
+│   ├── ZMQ_Schemas.py       # Bus message schemas
+│   └── README.md            # Teela subsystem docs
+├── .env.example             # Config template (both systems)
+├── requirements.txt         # Python dependencies
+├── README.md                # This file
+└── LICENSE                  # MIT License
+```
+
+**Total: ~1,900 lines of production code**
+
+---
+
+## 🔧 Unified Dependencies
+
+```
+fastapi
+uvicorn
+httpx
+python-dotenv
+numpy
+faster-whisper
+pyzmq
+opencv-python
+adafruit-circuitpython-servokit   # Teela hardware only
 ```
 
 ---
 
 ## 📋 Requirements
 
-- Python 3.11+
-- [Ollama](https://ollama.com) running locally
-- [Hume AI](https://hume.ai) API key (free tier)
-- USB Microphone + Speaker
-- Modern browser (Chrome 90+, Firefox 88+)
-
----
-
-## 🔧 Configuration
-
-All settings in `.env`:
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `HUME_API_KEY` | ✅ | Hume AI API key |
-| `HUME_VOICE_ID` | ✅ | Voice ID from Hume dashboard |
-| `OLLAMA_BASE_URL` | — | Ollama URL (default: `http://127.0.0.1:11434`) |
-| `OLLAMA_MODEL` | — | Model name (default: `kimi-k2.6:cloud`) |
-| `WHISPER_MODEL` | — | Whisper model: `tiny`, `base`, `small` (default: `base`) |
-
----
-
-## 🖥️ Usage
-
-1. Open `http://localhost:8765`
-2. Click **"🧪 Test Microphone"** — speak for 3 seconds
-3. If you hear your voice played back, the mic works! ✅
-4. Click & **hold** the big glowing orb button
-5. **Speak** — "Hello Hermes, how are you?"
-6. **Release** to send
-7. Wait 1-3 seconds — hear the emotional voice reply!
+| Component | Requirement |
+|-----------|-------------|
+| **OS** | Linux (Jetson Nano/Orin, x86_64, ARM64 SBC) |
+| **Python** | 3.11+ |
+| **Voice Chat** | USB mic + speaker, Chrome/Firefox |
+| **Teela** | CSI camera (IMX219/IMX477), PCA9685 servo driver, 2x MG996R |
+| **AI Backend** | Ollama running locally |
+| **TTS** | Hume AI API key (free tier) |
 
 ---
 
 ## 🐛 Troubleshooting
 
-**"Microphone access denied"** — Use `http://localhost:8765` (not IP). Browsers block mic on non-localhost HTTP.
+### Voice Chat
+- **"Mic access denied"** — Use `http://localhost:8765` (browsers block mic on non-localhost HTTP)
+- **"No audio detected"** — Test first with **🧪 Test Microphone**
+- **"No sound"** — Check `alsamixer`, test with `speaker-test -t sine -f 1000`
 
-**"No audio detected"** — Use Test Mic button first. Speak louder. Check USB mic is selected in browser.
-
-**No sound from speaker** — Check `alsamixer` or `pavucontrol`. Test with `speaker-test -t sine -f 1000`.
+### Teela Robotics
+- **"CSI pipeline failed"** — VisionNode auto-falls back to `/dev/video0` (V4L2)
+- **"No PCA9685 found"** — ActuationNode runs in FakeServo mode (logs angles, no physical motion)
+- **Calibration won't trigger** — Requires voice intent `"calibrate"` with confidence ≥ 0.75
 
 ---
 
 ## 🗂️ Changelog
 
-### v1.0.0 (2026-05-25)
+### v2.0.0 (2026-05-25) — Teela Robotics Integration
 
-#### 🎉 Initial Release
+#### 🤖 New: VisionKinematicSyncSkill
+
+**Four new production modules:**
+- **`teela/VisionNode.py`** (~280 lines) — GStreamer `nvarguscamerasrc` CSI pipeline, OpenCV face tracking in dedicated thread, publishes normalized pixel offsets to ZMQ `/vision/tracking`
+- **`teela/ActuationNode.py`** (~310 lines) — PCA9685 PWM servo control via `adafruit_servokit`, fake-servo headless fallback, ease-out-cubic + ease-in-out-sine interpolation, proportional tracking correction from vision offsets
+- **`teela/CalibrationStateMachine.py`** (~270 lines) — Deterministic 7-state FSM triggered by `/voice/intent` "calibrate". Executes: pan sweep → tilt sweep → return center → horizon calibration → audio-visual confirmation
+- **`teela/ZMQ_Schemas.py`** (~260 lines) — Shared JSON message schemas with type/range validation, builder functions, and self-test for all bus topics
+
+**Hardware targets:**
+- Jetson Nano / Jetson Orin with IMX219/IMX477 CSI camera
+- PCA9685 16-channel I2C PWM servo driver
+- 2-axis pan/tilt kit (MG996R / DS3218 servos)
+
+**Bus topics:** `/voice/intent`, `/vision/tracking`, `/vision/frame_meta`, `/motor/move_absolute`, `/motor/move_relative`, `/motor/position`, `/sys/status`, `/sys/cmd`, `/cal/progress`, `/cal/result`
+
+### v1.0.0 (2026-05-25) — Initial Voice Chat Release
 
 **Features:**
-- 🎤 **Voice-only chat** — No typing needed, just hold and speak
-- 🗣️ **Emotional TTS** via Hume AI Octave — LLM-powered voice with genuine feeling
-- 🧠 **Local STT** via faster-whisper — Speech-to-Text runs entirely on-device
-- 🔗 **Local LLM** via Ollama — OpenAI-compatible API, fully private inference
-- 🧪 **Mic Test Button** — Record 3 seconds and play back to verify your microphone
-- 📱 **Mobile/Touch Friendly** — Works on phones, tablets, and desktops
-- 🌊 **Live Waveform Visualization** — 15-bar animated waveform while recording
-- 🌈 **Dark Gradient UI** — Space-purple theme with glowing orb animations
-- 🎹 **Keyboard Shortcuts** — Hold `Space` to talk
-- 🔧 **Audio Resampling** — Browser records at ~48kHz, automatically resampled to 16kHz for Whisper
-- 📡 **Network Access** — CORS enabled, access from any device on your LAN
-- 🔊 **USB Speaker Support** — Audio plays through default ALSA output
+- 🎤 Voice-only chat — hold to talk, release to send
+- 🗣️ Hume AI Octave emotional TTS
+- 🧠 Local STT via faster-whisper (`base` model)
+- 🔗 Ollama via OpenAI-compatible `/v1/chat/completions`
+- 🧪 Built-in mic test button
+- 🌊 Live waveform visualization (15-bar)
+- 🌈 Space-purple dark gradient UI
+- 🎹 Spacebar keyboard shortcut
+- 🔧 Browser-side resampling (48kHz → 16kHz) + WAV encoding
+- 📡 CORS enabled for LAN access
+- 🔊 USB speaker support via ALSA
 
-**Tech Stack:**
-- **Backend:** FastAPI (Python) — serves static files + API endpoints
-- **Frontend:** Pure HTML/CSS/JS (no build step) — single file, zero dependencies
-- **Audio Capture:** Web Audio API (AudioWorklet with ScriptProcessor fallback)
-- **WAV Encoding:** Browser-side — Float32 → Int16 → WAV blob, no ffmpeg needed
-- **STT:** faster-whisper (`base` model) — runs on CPU, ~150MB download
-- **LLM:** Ollama via OpenAI-compatible `/v1/chat/completions` API
-- **TTS:** Hume AI Octave REST API — emotional, context-aware voice
+**Tech Stack:** FastAPI + pure HTML/CSS/JS frontend + faster-whisper + Ollama + Hume API
 
-**Compatibility:**
-- ✅ ARM64 / Jetson Nano / Jetson Orin
-- ✅ x86_64 / Desktop PCs
-- ✅ Chrome 90+, Firefox 88+, Safari 15+
-- ✅ Touch devices (phones, tablets)
-
----
-
-## 📦 Files
-
-```
-hermes-voice-chat/
-├── src/
-│   ├── main.py          # FastAPI backend (249 lines)
-│   └── index.html       # Voice-only web UI (400+ lines)
-├── .env.example         # Configuration template
-├── requirements.txt     # Dependencies
-├── README.md            # This file
-└── LICENSE              # MIT License
-```
+**Compatibility:** ARM64/Jetson, x86_64, Chrome 90+, Firefox 88+, touch devices
 
 ---
 
@@ -146,12 +258,13 @@ hermes-voice-chat/
 - [Hume AI Octave](https://hume.ai) for emotional TTS
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for local STT
 - [Ollama](https://ollama.com) for local LLM inference
+- Teela robotics built on [Jetson.GPIO](https://github.com/NVIDIA/jetson-gpio) + [Adafruit ServoKit](https://github.com/adafruit/Adafruit_CircuitPython_ServoKit)
 
 ---
 
 ## 📜 License
 
-MIT License
+MIT License 2026
 
 ---
 

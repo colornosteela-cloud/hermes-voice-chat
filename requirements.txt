@@ -1,6 +1,18 @@
+# Hermes Voice Chat + Teela Robotics
+# Install with: pip install -r requirements.txt
+
+# ── Voice Chat (src/) ──────────────────────────────────
 fastapi>=0.100
 uvicorn>=0.20
 httpx>=0.24
 python-dotenv>=1.0
 numpy>=1.24
 faster-whisper>=1.0
+
+# ── Teela Robotics (teela/) ────────────────────────────
+pyzmq>=25.0
+opencv-python>=4.8
+
+# Hardware (Jetson only — install separately if not on Jetson)
+# adafruit-circuitpython-servokit
+# Jetson.GPIO  (usually pre-installed on Jetson)
