@@ -164,11 +164,10 @@ def main():
         print("\n" + "⚠️" * 20)
         print("   TILT UP — MOST DANGEROUS DIRECTION")
         print("   This moves the brain UP toward the body/mount.")
-        print("   Use the smallest steps. Stop IMMEDIATELY if you hear strain.")
+        print("   Step size reduced to 0.5°. Stop IMMEDIATELY if you hear strain.")
         print("⚠️" * 20)
         tilt_max = sweep_direction(pca, args.tilt_pin, args.invert_tilt,
-                                    step=+args.step_up, label="TILT UP",
-                                    confirm_each=True)  # extra cautious!
+                                    step=+args.step_up, label="TILT UP")
 
         # --- Calculate center ---
         tilt_center = (tilt_min + tilt_max) / 2.0
