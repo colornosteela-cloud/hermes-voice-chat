@@ -23,19 +23,6 @@ import traceback
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
-try:
-    import Jetson.GPIO as GPIO
-    JETSON_GPIO = True
-except Exception:
-    JETSON_GPIO = False
-    GPIO = None
-
-try:
-    from adafruit_servokit import ServoKit
-    SERVOKIT = True
-except Exception:
-    SERVOKIT = False
-
 import zmq
 
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(levelname)s: %(message)s")
@@ -182,8 +169,8 @@ class ActuationNode:
                 t.join(timeout=2.0)
         self._sub.close()
         self._pub.close()
-        if JETSON_GPIO and GPIO:
-            GPIO.cleanup()
+        if hasattr(self, "_pca") and self._pca:
+            self._pca.deinit()
         logger.info("ActuationNode stopped.")
 
     @property
@@ -194,25 +181,16 @@ class ActuationNode:
     # ── Hardware Init ────────────────────────────
 
     def _init_hardware(self) -> None:
-        if SERVOKIT:
-            try:
-                self._kit = ServoKit(channels=16, address=self.cfg.i2c_address)
-                self._pan_servo = self._kit.servo[self.cfg.pan_pin]
-                self._tilt_servo = self._kit.servo[self.cfg.tilt_pin]
-                # Set safe defaults
-                self._pan_servo.angle = 90.0   # PCA9685 native: 0-180 mid=90
-                self._tilt_servo.angle = 90.0
-                self._pan_current = 0.0        # Logical: -90..+90
-                self._tilt_current = 0.0
-                logger.info("PCA9685 servo driver initialized via adafruit_servokit.")
-                return
-            except Exception:
-                logger.warning("ServoKit init failed. Using FAKE servos for headless/dev.")
-
-        # Fallback: fake servos (no physical hardware needed)
-        self._pan_servo = FakeServo(self.cfg.pan_pin, "PAN")
-        self._tilt_servo = FakeServo(self.cfg.tilt_pin, "TILT")
-        logger.warning("Running in FAKE mode — no physical servos connected.")
+        """Initialize PCA9685 via direct I2C driver (bypasses broken Jetson.GPIO)."""
+        try:
+            from utils.pca9685_driver import PCA9685
+            self._pca = PCA9685(bus=7, address=0x40, freq=50)
+            self._real_hardware = True
+            logger.info("PCA9685 servo driver initialized via direct I2C (smbus2).")
+        except Exception as e:
+            logger.warning(f"PCA9685 direct I2C failed: {e}. Using FakeServo.")
+            self._pca = None
+            self._real_hardware = False
 
     # ── Motion Thread (interpolation loop) ───────
 
@@ -252,11 +230,15 @@ class ActuationNode:
             time.sleep(sleep_for)
 
     def _write_hardware(self) -> None:
-        """Map logical degrees to servo-native range and send to PCA9685."""
-        if self._pan_servo is None or self._tilt_servo is None:
+        """Send current pan/tilt angles to PCA9685."""
+        if not self._real_hardware or self._pca is None:
             return
-        self._pan_servo.angle = self._logical_to_native(self._pan_current)
-        self._tilt_servo.angle = self._logical_to_native(self._tilt_current)
+        # Map logical -90..+90 → servo-native 0..180
+        pan_native = self._pan_current + 90.0
+        tilt_native = self._tilt_current + 90.0
+        self._pca.set_servo_angle(self.cfg.pan_pin, pan_native)
+        self._pca.set_servo_angle(self.cfg.tilt_pin, tilt_native)
+        logger.debug(f"Servo write: pan={pan_native:.1f}° tilt={tilt_native:.1f}°")
 
     def _logical_to_native(self, deg: float) -> float:
         """Map logical range (-90..+90) to servo-native (0..180)."""
