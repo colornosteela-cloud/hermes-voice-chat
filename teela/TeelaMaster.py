@@ -340,9 +340,11 @@ class TeelaMaster:
     def _write_hardware(self) -> None:
         if self._pca is None:
             return
+        pan_cmd = -self._pan_current if self.args.invert_pan else self._pan_current
+        tilt_cmd = -self._tilt_current if self.args.invert_tilt else self._tilt_current
         try:
-            self._pca.set_servo_angle(self.args.pan_pin, self._pan_current + 90.0)
-            self._pca.set_servo_angle(self.args.tilt_pin, self._tilt_current + 90.0)
+            self._pca.set_servo_angle(self.args.pan_pin, pan_cmd + 90.0)
+            self._pca.set_servo_angle(self.args.tilt_pin, tilt_cmd + 90.0)
         except Exception as e:
             logger.debug(f"Servo write error: {e}")
 
@@ -520,8 +522,10 @@ class TeelaMaster:
             tilt = self._tilt_current
         self._pan_current = pan
         self._tilt_current = tilt
-        self._pca.set_servo_angle(self.args.pan_pin, pan + 90.0)
-        self._pca.set_servo_angle(self.args.tilt_pin, tilt + 90.0)
+        pan_cmd = -pan if self.args.invert_pan else pan
+        tilt_cmd = -tilt if self.args.invert_tilt else tilt
+        self._pca.set_servo_angle(self.args.pan_pin, pan_cmd + 90.0)
+        self._pca.set_servo_angle(self.args.tilt_pin, tilt_cmd + 90.0)
 
     # ── Display Thread ─────────────────────────
 
@@ -651,6 +655,10 @@ if __name__ == "__main__":
     parser.add_argument("--servo-test", action="store_true", help="Quick servo sweep and exit")
     parser.add_argument("--pan-pin", type=int, default=0)
     parser.add_argument("--tilt-pin", type=int, default=1)
+    parser.add_argument("--invert-pan", action="store_true",
+                        help="Invert pan direction (servo physically moves opposite to command)")
+    parser.add_argument("--invert-tilt", action="store_true",
+                        help="Invert tilt direction")
     parser.add_argument("--pan-min", type=float, default=-80.0)
     parser.add_argument("--pan-max", type=float, default=80.0)
     parser.add_argument("--tilt-min", type=float, default=-30.0)
