@@ -300,9 +300,13 @@ class TeelaMaster:
                         self._tilt_target = self._limits.clamp_tilt(ty)
 
     def _detect_face(self, frame: np.ndarray) -> Optional[dict]:
+        """Detect largest frontal face and return normalized offset."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = self._face_cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)
+            gray,
+            scaleFactor=1.2,    # faster pyramid, detects more faces
+            minNeighbors=3,     # less strict (was 5)
+            minSize=(30, 30)  # detect smaller faces (was 40×40)
         )
         if len(faces) == 0:
             return None

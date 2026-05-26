@@ -245,5 +245,106 @@ async def debug_echo(audio: UploadFile = File(...)):
         "message": "Your recording has been saved. Try playing the echo_url to verify audio was captured."
     })
 
+# ── Robot Control (Teela Integration) ───────────────────────────
+# Simple servo controller that talks directly to PCA9685 over I2C
+
+class RobotController:
+    """Lightweight servo controller for voice-chat integration."""
+    def __init__(self):
+        self._pca = None
+        self._limits = None
+        self._pan_pin = 0
+        self._tilt_pin = 1
+        self._invert_pan = True
+        self._pan_angle = 0.0
+        self._tilt_angle = 0.0
+        self._init()
+    
+    def _init(self):
+        import json, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'teela'))
+        from utils.pca9685_driver import PCA9685
+        try:
+            self._pca = PCA9685(bus=7, address=0x40, freq=50)
+        except Exception as e:
+            print(f"[Robot] PCA9685 not available: {e}")
+            return
+        # Load limits
+        cfg_path = os.path.expanduser("~/.config/teela/calibration.json")
+        if os.path.isfile(cfg_path):
+            with open(cfg_path) as f:
+                self._limits = json.load(f)
+        # Center
+        self.move(0.0, 0.0)
+        print("[Robot] Servo controller ready.")
+    
+    def move(self, pan: float, tilt: float) -> dict:
+        if self._pca is None:
+            return {"error": "PCA9685 not connected"}
+        # Clamp
+        if self._limits:
+            pan = max(self._limits.get("pan_min", -180), min(self._limits.get("pan_max", 90), pan))
+            tilt = max(self._limits.get("tilt_min", -40), min(self._limits.get("tilt_max", 70), tilt))
+        # Invert pan
+        pan_cmd = -pan if self._invert_pan else pan
+        self._pca.set_servo_angle(self._pan_pin, pan_cmd + 90.0)
+        self._pca.set_servo_angle(self._tilt_pin, tilt + 90.0)
+        self._pan_angle = pan
+        self._tilt_angle = tilt
+        return {"pan": pan, "tilt": tilt}
+    
+    def calibrate(self) -> dict:
+        """Quick center + sweep."""
+        if self._pca is None:
+            return {"error": "PCA9685 not connected"}
+        import time
+        # Center
+        self.move(0.0, 0.0)
+        time.sleep(0.3)
+        # Small sweep
+        if self._limits:
+            pan_range = [self._limits.get("pan_min", -60), self._limits.get("pan_max", 60)]
+            for target in [pan_range[0], pan_range[1], 0.0]:
+                self.move(target, 0.0)
+                time.sleep(0.5)
+        return {"status": "calibrated", "pan": self._pan_angle, "tilt": self._tilt_angle}
+    
+    def status(self) -> dict:
+        return {
+            "pan": self._pan_angle,
+            "tilt": self._tilt_angle,
+            "limits": self._limits,
+            "connected": self._pca is not None
+        }
+
+# Singleton robot controller
+_robot: RobotController | None = None
+
+def get_robot() -> RobotController:
+    global _robot
+    if _robot is None:
+        _robot = RobotController()
+    return _robot
+
+@app.post("/api/robot/move")
+async def robot_move(data: dict):
+    """Move servos to target angles. JSON body: {\"pan\": 0, \"tilt\": 0}"""
+    robot = get_robot()
+    result = robot.move(data.get("pan", 0.0), data.get("tilt", 0.0))
+    return JSONResponse(result)
+
+@app.post("/api/robot/calibrate")
+async def robot_calibrate():
+    """Run servo calibration sweep."""
+    robot = get_robot()
+    result = robot.calibrate()
+    return JSONResponse(result)
+
+@app.get("/api/robot/status")
+async def robot_status():
+    """Get current servo angles and limits."""
+    robot = get_robot()
+    return JSONResponse(robot.status())
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
