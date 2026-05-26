@@ -162,6 +162,36 @@
         .debug-panel strong { color: #888; }
 
         .hint { color: #555; font-size: 0.8rem; margin-top: 1rem; }
+
+        /* ── Mic Test Meter (like webcammictest.com) ── */
+        .mic-test-panel {
+            background: rgba(0,0,0,0.25);
+            border-radius: 16px;
+            padding: 1rem;
+            margin-top: 1rem;
+            display: none;
+        }
+        .mic-test-panel.active { display: block; }
+        .meter-label { font-size: 0.75rem; color: #888; margin-bottom: 0.3rem; text-transform: uppercase; letter-spacing: 1px; }
+        .volume-meter {
+            display: flex;
+            gap: 2px;
+            height: 24px;
+            align-items: flex-end;
+            justify-content: center;
+            margin-bottom: 0.5rem;
+        }
+        .meter-bar {
+            width: 6px;
+            background: #333;
+            border-radius: 1px;
+            transition: background 0.05s, height 0.05s;
+            height: 2px;
+        }
+        .meter-bar.lit-green { background: #2ecc71; }
+        .meter-bar.lit-yellow { background: #f1c40f; }
+        .meter-bar.lit-red { background: #e74c3c; }
+        .playback-audio { width: 100%; margin-top: 0.5rem; }
     </style>
 </head>
 <body>
@@ -170,6 +200,14 @@
         <p class="subtitle">Hold the button, speak, release — I'll reply with voice</p>
 
         <button class="test-btn" id="testBtn">🧪 Test Microphone (record 3s, play it back)</button>
+
+        <!-- Mic Test Panel -->
+        <div class="mic-test-panel" id="micTestPanel">
+            <div class="meter-label">🔴 Live Microphone Level</div>
+            <div class="volume-meter" id="volumeMeter"></div>
+            <div class="meter-label">Playback Test</div>
+            <audio class="playback-audio" id="playbackAudio" controls></audio>
+        </div>
 
         <div class="wave-container" id="waveContainer">
             <div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div>
@@ -387,55 +425,112 @@
             return new Blob([buf], { type: 'audio/wav' });
         }
 
-        // ── Test Mic ────────────────────────────────────
+        // ── Volume Meter (like webcammictest.com) ────────────
+        const micTestPanel = document.getElementById('micTestPanel');
+        const volumeMeter = document.getElementById('volumeMeter');
+        const playbackAudio = document.getElementById('playbackAudio');
+        const METER_BARS = 20;
+        for (let i = 0; i < METER_BARS; i++) {
+            const bar = document.createElement('div');
+            bar.className = 'meter-bar';
+            volumeMeter.appendChild(bar);
+        }
+        const meterBars = Array.from(volumeMeter.children);
+
+        function updateMeter(analyser) {
+            const data = new Uint8Array(analyser.frequencyBinCount);
+            analyser.getByteFrequencyData(data);
+            const avg = data.reduce((a, b) => a + b, 0) / data.length;
+            const pct = avg / 255;
+            const litCount = Math.ceil(pct * METER_BARS);
+            meterBars.forEach((bar, i) => {
+                const h = Math.max(2, Math.round(((i + 1) / METER_BARS) * 22));
+                bar.style.height = h + 'px';
+                if (i < litCount) {
+                    bar.className = 'meter-bar ' + (i < METER_BARS * 0.6 ? 'lit-green' : i < METER_BARS * 0.85 ? 'lit-yellow' : 'lit-red');
+                } else {
+                    bar.className = 'meter-bar';
+                }
+            });
+        }
+
+        // ── Test Mic (with live meter + playback) ─────────
         testBtn.addEventListener('click', async () => {
             if (isRecording) return;
             testBtn.disabled = true;
-            setStatus('listening', 'Test: Recording 3 seconds...');
-            debug('Test recording started');
+            micTestPanel.classList.add('active');
+            setStatus('listening', '🔴 Speak now — watching your mic level');
+            debug('Mic test started');
 
-            const recorder = await startCapture('test');
-            if (!recorder) { testBtn.disabled = false; return; }
-            isRecording = true;
-            micBtn.classList.add('recording');
-            orbRing.classList.add('active');
-            waveContainer.classList.add('active');
-            updateWaveform();
+            let analyser, meterInterval;
+            try {
+                const recorder = await startCapture('test');
+                if (!recorder) { testBtn.disabled = false; return; }
 
-            // Stop after 3 seconds
-            setTimeout(async () => {
+                // Create analyser from the same mic source for the meter
+                if (recorder.source) {
+                    analyser = audioCtx.createAnalyser();
+                    analyser.fftSize = 64;
+                    recorder.source.connect(analyser);
+                }
+
+                isRecording = true;
+                micBtn.classList.add('recording');
+                orbRing.classList.add('active');
+                waveContainer.classList.add('active');
+                updateWaveform();
+
+                // Animate meter
+                if (analyser) {
+                    meterInterval = setInterval(() => updateMeter(analyser), 50);
+                }
+
+                // Record for 5 seconds
+                await new Promise(r => setTimeout(r, 5000));
                 isRecording = false;
-                setStatus('thinking', 'Test: Processing...');
+                if (meterInterval) clearInterval(meterInterval);
+                micBtn.classList.remove('recording');
+                orbRing.classList.remove('active');
+                waveContainer.classList.remove('active');
+
+                setStatus('thinking', 'Processing your recording...');
                 const samples = await stopCapture(recorder);
-                if (!samples) { setStatus('', 'No audio captured'); testBtn.disabled = false; return; }
+                if (!samples) {
+                    setStatus('', 'No audio captured');
+                    testBtn.disabled = false;
+                    micTestPanel.classList.remove('active');
+                    return;
+                }
 
                 const int16 = floatToInt16(samples);
                 const wavBlob = encodeWAV(int16, 16000, 1);
                 debug(`Test WAV: ${(wavBlob.size/1024).toFixed(1)} KB`);
 
-                // Send to echo endpoint
-                const fd = new FormData();
-                fd.append('audio', wavBlob, 'test.wav');
-                try {
-                    const resp = await fetch('/api/debug/echo', { method: 'POST', body: fd });
-                    const result = await resp.json();
-                    debug(`Echo saved: ${result.echo_url}`);
-
-                    // Play it back!
-                    setStatus('speaking', 'Test: Playing back your voice...');
-                    const audio = new Audio(result.echo_url);
-                    audio.play();
-                    audio.onended = () => {
-                        setStatus('', 'Test complete! Tap mic to chat');
-                        testBtn.disabled = false;
-                        debug('Test complete — if you heard yourself, mic is working');
-                    };
-                } catch (e) {
-                    debug('Echo error: ' + e.message);
-                    setStatus('', 'Test failed');
+                // Playback locally via blob URL
+                const wavUrl = URL.createObjectURL(wavBlob);
+                playbackAudio.src = wavUrl;
+                playbackAudio.style.display = 'block';
+                playbackAudio.play();
+                setStatus('speaking', '▶️ Playing back your voice...');
+                playbackAudio.onended = () => {
+                    setStatus('', '✅ Mic test complete! Tap mic button to chat with Teela');
                     testBtn.disabled = false;
-                }
-            }, 3000);
+                    micTestPanel.classList.remove('active');
+                    debug('Mic test complete — if you heard yourself, everything works');
+                };
+
+                // Also save to server for inspection
+                const fd = new FormData();
+                fd.append('audio', wavBlob, 'mic_test.wav');
+                fetch('/api/debug/echo', { method: 'POST', body: fd }).catch(() => {});
+
+            } catch (err) {
+                debug('Mic test error: ' + err.message);
+                showError('Microphone error: ' + err.message);
+                testBtn.disabled = false;
+                micTestPanel.classList.remove('active');
+                if (meterInterval) clearInterval(meterInterval);
+            }
         });
 
         // ── Chat ────────────────────────────────────────
