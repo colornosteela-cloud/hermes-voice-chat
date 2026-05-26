@@ -123,7 +123,7 @@ class PCA9685:
         self._write_byte(base + 3, (off >> 8) & 0x0F)
 
     def set_servo_angle(self, channel: int, angle: float) -> None:
-        angle = max(0.0, min(180.0, angle))
+        angle = max(0.0, min(270.0, angle))  # widened: support 0-270° servos
         on_val, off_val = self._calc_pwm_counts(angle)
         self.set_pwm(channel, on_val, off_val)
         logger.debug(f"CH{channel} → {angle:.1f}°")
