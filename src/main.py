@@ -95,8 +95,14 @@ def read_wav_bytes(wav_bytes: bytes) -> np.ndarray:
     return samples.astype(np.float32) / np.iinfo(dtype).max
 
 async def transcribe_wav(wav_bytes: bytes) -> str:
-    """Transcribe WAV bytes to text."""
+    """Transcribe WAV bytes to text. Saves a copy for diagnostics."""
     model = load_whisper()
+    
+    # Save diagnostic copy
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    diag_path = AUDIO_DIR / f"input_{ts}.wav"
+    diag_path.write_bytes(wav_bytes)
+    print(f"[Whisper] Input saved to {diag_path} ({len(wav_bytes)} bytes)")
     
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         f.write(wav_bytes)
